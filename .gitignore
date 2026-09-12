@@ -70,3 +70,5 @@ dagre/
 graphlib/
 uv.lock
 pi_session_window0.jsonl
+.radv/
+extra/vulkan/.cache/

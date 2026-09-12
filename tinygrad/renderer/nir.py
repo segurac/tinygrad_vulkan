@@ -88,7 +88,15 @@ nstore = nir_instr(has_def=False, df=lambda addr:addr, intrins=lambda space,val:
 nload = nir_instr(nc=lambda u:u.max_numel(), bs=lambda u:u.dtype.bitsize, num_components=lambda u:u.max_numel(),
   intrins=lambda space,u:{**({"ACCESS":mesa.ACCESS_CAN_REORDER} if space==AddrSpace.GLOBAL else {}),
                           **({"ALIGN_MUL":u.dtype.itemsize*u.max_numel()} if space != AddrSpace.REG else {})}, srcs=lambda addr: [nsrc(addr)])(
-    lambda b, space, addr, u: mesa.nir_intrinsic_instr_create(b.shader, g(f"nir_intrinsic_load_{scope(space)}")))
+  lambda b, space, addr, u: mesa.nir_intrinsic_instr_create(b.shader, g(f"nir_intrinsic_load_{scope(space)}")))
+
+# load/store through a zink bo-wrapper deref chain (struct{ T data[N]; }): the deref intrinsics have no ALIGN_MUL
+spv_nload = nir_instr(nc=1, bs=lambda dt: dt.bitsize, num_components=1,
+  intrins=lambda glb: ({"ACCESS":mesa.ACCESS_CAN_REORDER} if glb else {}), srcs=lambda addr: [nsrc(addr)])(
+  lambda b, addr, dt, glb: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_deref))
+spv_nstore = nir_instr(has_def=False, df=lambda addr: addr, num_components=1,
+  intrins=lambda glb: {"WRITE_MASK":1, **({"ACCESS":mesa.ACCESS_CAN_REORDER} if glb else {})}, srcs=lambda addr, val: [nsrc(addr), nsrc(val)])(
+  lambda b, addr, val, dt, glb: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_store_deref))
 
 ngid = nir_instr(nc=3, bs=32)(lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_workgroup_id))
 nlid = nir_instr(nc=3, bs=32)(lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_local_invocation_id))
@@ -321,3 +329,116 @@ class IR3Renderer(NIRRenderer):
     self.b.shader.contents.info.num_images = texs() + imgs()
 
   def supported_dtypes(self): return {d for d in NIRRenderer.supported_dtypes(self) if d != dtypes.double}
+
+class SPIRVRenderer(LVPRenderer):
+  # NIR for the zink nir_to_spirv exporter: scalar params are read from a params UBO (one uint64 per slot)
+  # and global buffers are SSBOs in zink's bo-wrapper layout (struct{ T data[N]; }), accessed by deref chains.
+  nir_options = b"\0" * len(mesa.lvp_nir_options)
+  # LVPRenderer is a CPU-ish llvmpipe target (no locals, single thread). The SPIR-V path is a real
+  # GPU backend: allow locals+full grids (RADV maxComputeWorkGroupCount=[4294967295,65535,65535]).
+  # has_local=True is required so postrange.convert_loop_to_global marks output ranges GLOBAL
+  # (otherwise every kernel stays serialized at global=(1,1,1)).
+  has_local = True
+  global_max = CUDARenderer.global_max
+  def_rewrite = PatternMatcher([
+    (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"),UPat.var("off")), allow_any_len=True), UPat.var("val"))),
+     lambda ctx,buf,off,val: ctx.sstore(ctx.b, buf, off, val)),
+    (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("off")), allow_any_len=True), UPat.var("alt"),
+                        UPat.var("gate")), name="x"),
+     lambda ctx,x,buf,off,alt,gate: ctx.sload(ctx.b, x, buf, off, alt, gate)),
+    (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("off")), allow_any_len=True),), name="x"),
+     lambda ctx,x,buf,off: ctx.sload(ctx.b, x, buf, off, None, None)),
+  ]) + LVPRenderer.def_rewrite
+
+  def __init__(self, target:Target = Target(arch="x86_64")): super().__init__(target)
+
+  def _bo_var(self, b, mode, elem_dt, n, name, binding, driver_location=0):
+    fields = (mesa.struct_glsl_struct_field * 1)()
+    fields[0].type = mesa.glsl_array_type(glsl_type(elem_dt), n, 0)
+    fields[0].name = ctypes.cast(ctypes.create_string_buffer(b"data"), POINTER[ctypes.c_char])
+    name_buf = ctypes.create_string_buffer(name)
+    var = mesa.nir_variable_create(b.shader, mode, mesa.glsl_struct_type_with_explicit_alignment(fields, 1, name_buf, False, 1), name_buf).contents
+    var.data.descriptor_set, var.data.binding, var.data.driver_location = 0, binding, driver_location
+    return var
+
+  def _bo_deref(self, b, var, idx):
+    vd, field = deref_var(b, var), mesa.glsl_get_struct_field(var.type, 0)
+    sd = mesa.nir_deref_instr_create(b.shader, mesa.nir_deref_type_struct)
+    sd.contents.parent, sd.contents.strct.index, sd.contents.modes, sd.contents.type = nsrc(vd), 0, var.data.mode, field
+    mesa.nir_def_init(sd.contents.instr, sd.contents._def, 1, 32)
+    mesa.nir_builder_instr_insert(b, sd.contents.instr)
+    ad = mesa.nir_deref_instr_create(b.shader, mesa.nir_deref_type_array)
+    ad.contents.parent, ad.contents.arr.index = nsrc(sd.contents._def), nsrc(idx)
+    ad.contents.modes, ad.contents.type = var.data.mode, mesa.glsl_get_array_element(field)
+    mesa.nir_def_init(ad.contents.instr, ad.contents._def, 1, 32)
+    mesa.nir_builder_instr_insert(b, ad.contents.instr)
+    return ad.contents._def
+
+  def _param_val(self, b, x):
+    d = self._bo_deref(b, self.ubo_var, nimm(b, self._alu_idx, dtypes.int))
+    self._alu_idx += 1
+    u64 = spv_nload(b, d, dtypes.ulong, True)
+    op = {**{d:f"i2i{d.bitsize}" for d in dtypes.sints}, **{d:f"u2u{d.bitsize}" for d in dtypes.uints},
+          **{d:f"f2f{d.bitsize}" for d in dtypes.floats}}.get(x.dtype)
+    assert op is not None, f"unsupported param dtype {x.dtype}"
+    return nalu(b, op, u64)
+
+  def param(self, b, x, sz): return self._param_val(b, x) if x.addrspace is AddrSpace.ALU else nimm(b, 0, dtypes.long)
+  def _idx32(self, b, off): return off if off.bit_size == 32 else nalu(b, "i2i32", off)
+
+  def _lane_idx(self, b, off, j):
+    # one element index per lane: pick component j of the (possibly vector) off and convert it to the 32-bit index the emitter wants
+    ssa = self.r[off]
+    return self._idx32(b, ssa if ssa.num_components == 1 else nchannel(b, ssa, j))
+  def _lane_idx_k(self, b, off, j, k):
+    # component k of lane j is the element at off_j + k (a vectorized load/store is d consecutive elements per lane)
+    idx = self._lane_idx(b, off, j)
+    return idx if k == 0 else nalu(b, "iadd", idx, nimm(b, k, dtypes.int))
+
+  def sload(self, b, x, buf, off, alt, gate):
+    # the zink emitter has no phi: a gated load does the access and selects with bcsel (no OOB guard, SPIR-V handles bounds)
+    r, space = self.r, buf.addrspace
+    lanes, d = off.max_numel(), x.max_numel() // off.max_numel()
+    if space is AddrSpace.ALU: loaded = r[buf]  # scalar param: a register read, always in range
+    elif space is AddrSpace.GLOBAL:
+      # the zink wrapper is a scalar array (struct{ T data[N]; }): one 1-wide load per (lane, component); component k of lane j
+      # is the element at off_j + k. a single load_deref is 1-component, so a vec{d} is built from d separate scalar loads
+      lds = [spv_nload(b, self._bo_deref(b, self.buf_vars[buf], self._lane_idx_k(b, off, j, k)), buf.dtype, True)
+             for j in range(lanes) for k in range(d)]
+      loaded = nalu(b, f"vec{lanes * d}", *lds) if lanes * d > 1 else lds[0]
+    elif space is AddrSpace.LOCAL:
+      # the emitter's load_shared takes a scalar offset: one 1-wide load per lane (x1 is a scalar proxy for the def width/dtype)
+      x1 = UOp.const(0, x.dtype)
+      comps = [nload(b, AddrSpace.LOCAL, self._lane_idx(b, off, j), x1) for j in range(lanes)]
+      loaded = nalu(b, f"vec{lanes * d}", *comps) if lanes * d > 1 else comps[0]
+    else: loaded = nload(b, space, nidx(b, r[buf], r[off], space, buf.dtype.itemsize), x)
+    return nalu(b, "bcsel", r[gate], loaded, r[alt]) if gate is not None else loaded
+
+  def sstore(self, b, buf, off, val):
+    # must return a def (the last address), a None return falls through to the base class pattern (nir_intrinsic_store_<space>)
+    r, space = self.r, buf.addrspace
+    lanes, d = off.max_numel(), val.max_numel() // off.max_numel()
+    if space is AddrSpace.GLOBAL:
+      # mirror sload: store_deref is 1-component, so a vec{d} value is stored as d separate scalar stores at off_j + k
+      addr = None
+      for j in range(lanes):
+        for k in range(d):
+          v = r[val] if lanes * d == 1 else nchannel(b, r[val], j * d + k)
+          spv_nstore(b, addr := self._bo_deref(b, self.buf_vars[buf], self._lane_idx_k(b, off, j, k)), v, buf.dtype, True)
+      return addr
+    if space is AddrSpace.LOCAL:
+      addr = None
+      for j in range(lanes):
+        nstore(b, AddrSpace.LOCAL, addr := self._lane_idx(b, off, j), r[val] if lanes * d == 1 else nchannel(b, r[val], j * d))
+      return addr
+    return nstore(b, space, nidx(b, r[buf], r[off], space, buf.dtype.itemsize), r[val])
+
+  def prerender(self, uops):
+    super().prerender(uops)
+    self._alu_idx = 0
+    alu_params = [u for u in uops if u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU]
+    self.ubo_var = self._bo_var(self.b, mesa.nir_var_mem_ubo, dtypes.ulong, len(alu_params), b"params", 0) if alu_params else None
+    self.buf_vars: dict[UOp, Any] = {}
+    for u in (u for u in uops if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU):
+      self.buf_vars[u] = self._bo_var(self.b, mesa.nir_var_mem_ssbo, u.dtype, u.max_numel(),
+        f"buf{len(self.buf_vars)}".encode(), 1+len(self.buf_vars))

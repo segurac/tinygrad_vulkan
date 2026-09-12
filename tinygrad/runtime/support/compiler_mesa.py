@@ -1,4 +1,4 @@
-import base64, ctypes, pathlib, tempfile, hashlib
+import base64, ctypes, os, pathlib, tempfile, hashlib
 from tinygrad.device import Compiler
 from tinygrad.helpers import cpu_objdump, system, data64
 from tinygrad.runtime.autogen import mesa, llvm, libc
@@ -131,3 +131,42 @@ class IR3Compiler(Compiler):
     return v, cs, shifted[:v.imm_state.count * 4], shifted[v.imm_state.count * 4:]
 
   def disassemble(self, lib: bytes): disas_adreno(self.unpack_lib(lib)[3], self.dev_id.gpu_id)
+
+_libtinyzink = None
+def _load_libtinyzink():
+  global _libtinyzink
+  if _libtinyzink is None:
+    # zink's NIR->SPIR-V exporter, built from mesa 25.2.7 by extra/vulkan/build_libtinyzink.sh
+    path = pathlib.Path(os.getenv("TINYGRAD_LIBTINYZINK", str(pathlib.Path(__file__).parents[3] / "extra" / "vulkan" / "libtinyzink.so")))
+    if not path.exists():
+      raise RuntimeError(f"the VULKAN backend needs {path}; build it with 'bash extra/vulkan/build_libtinyzink.sh' "
+                         f"(after 'pip install tinymesa==25.2.7.2'), or point TINYGRAD_LIBTINYZINK at it")
+    lib = ctypes.CDLL(path)
+    lib.tinyzink_nirblob_to_spirv.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                              ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32)), ctypes.POINTER(ctypes.c_size_t)]
+    lib.tinyzink_nirblob_to_spirv.restype = ctypes.c_int
+    lib.tinyzink_free_words.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+    lib.tinyzink_free_words.restype = None
+    _libtinyzink = lib
+  return _libtinyzink
+
+class SPIRVCompiler(Compiler):
+  def __init__(self, arch):
+    self.arch = arch
+    self.lib = _load_libtinyzink()
+    super().__init__(f"compile_spirv_{arch}")
+
+  def __reduce__(self): return SPIRVCompiler, (self.arch,)
+
+  def compile(self, src) -> bytes:
+    # src is the base64 encoded serialized NIR blob from the renderer (or the raw blob bytes)
+    blob = base64.b64decode(src) if isinstance(src, str) else bytes(src)
+    out_words, out_num = ctypes.POINTER(ctypes.c_uint32)(), ctypes.c_size_t(0)
+    assert self.lib.tinyzink_nirblob_to_spirv(blob, len(blob), ctypes.byref(out_words), ctypes.byref(out_num)) == 0, "nir_to_spirv failed"
+    ret = bytes((ctypes.c_uint32 * out_num.value).from_address(ctypes.addressof(out_words.contents)))
+    self.lib.tinyzink_free_words(out_words)
+    return ret
+
+  def disassemble(self, lib: bytes):
+    words = (ctypes.c_uint32 * (len(lib) // 4)).from_buffer_copy(lib)
+    print(f"SPIR-V version 0x{words[1]:08x} generator 0x{words[2]:08x} bounds 0x{words[3]:08x} schema 0x{words[4]:08x} ({len(words)} words)")

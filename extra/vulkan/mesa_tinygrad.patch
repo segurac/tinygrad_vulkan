@@ -1,0 +1,29 @@
+diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+index 064bce8..fddab1c 100644
+--- a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
++++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+@@ -1364,14 +1364,16 @@ emit_bo(struct ntv_context *ctx, struct nir_variable *var, bool aliased)
+    if (aliased)
+       spirv_builder_emit_decoration(&ctx->builder, var_id, SpvDecorationAliased);
+ 
+-   unsigned idx = bitsize >> 4;
+-   assert(idx < ARRAY_SIZE(ctx->ssbos));
+-   if (ssbo) {
+-      assert(!ctx->ssbos[idx]);
+-      ctx->ssbos[idx] = var_id;
+-      if (bitsize == 32)
+-         ctx->ssbo_vars = var;
+-   } else {
++    unsigned idx = bitsize >> 4;
++    assert(idx < ARRAY_SIZE(ctx->ssbos));
++    if (ssbo) {
++      /* tinygrad patch: keep the first var per bitsize (ctx->ssbos only feeds emit_get_ssbo_size, which tinygrad never emits) instead of asserting, since tinygrad needs several SSBOs of the same bit-width */
++      if (!ctx->ssbos[idx]) {
++         ctx->ssbos[idx] = var_id;
++         if (bitsize == 32)
++            ctx->ssbo_vars = var;
++      }
++    } else {
+       assert(!ctx->ubos[var->data.driver_location][idx]);
+       ctx->ubos[var->data.driver_location][idx] = var_id;
+       ctx->ubo_vars[var->data.driver_location] = var;
