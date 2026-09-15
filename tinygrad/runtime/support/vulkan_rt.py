@@ -4,6 +4,8 @@ Struct layouts match Vulkan-Headers v1.4.305 (extra/vulkan/include/vulkan/vulkan
 Only what a compute device needs: one queue family, buffers (mapped or
 device-local + staging), a ring of (command buffer, fence) pairs so submits can be
 async and pipelined, compute pipelines, storage/uniform buffer descriptors.
+Kernels accumulate in the pending command buffer; submit() ends+submits it, so work is
+launched in batches (one submit per batch, not per kernel).
 """
 import ctypes as C
 import glob
@@ -50,6 +52,13 @@ _RESULTS = {
 # in-flight submits allowed: the (command buffer, fence) ring depth. submit() only blocks
 # (backpressure) when it wraps around to a slot whose fence has not signaled yet.
 RING = 8
+# flush points for the pending (unsubmitted) command buffer, so the fence ring keeps
+# cycling and the CPU can't outrun the GPU by an unbounded count. CB_FLUSH_KERNELS is the
+# normal point (a kernel's bind/bdesc/dispatch must never be split across cbs: a dispatch
+# recorded in a fresh cb has no pipeline bound and the driver crashes). CB_FLUSH_MAX is a
+# command-count backstop for copy-heavy runs; it only fires between kernels.
+CB_FLUSH_KERNELS = 128
+CB_FLUSH_MAX = 512
 
 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 1
 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 2
@@ -64,6 +73,8 @@ VK_SHARING_MODE_EXCLUSIVE = 0
 VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0
 VK_PIPELINE_BIND_POINT_COMPUTE = 1
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
+VK_ACCESS_SHADER_READ_BIT = 0x2000
+VK_ACCESS_SHADER_WRITE_BIT = 0x4000
 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6
 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7
 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC = 8
@@ -89,6 +100,7 @@ ST_WRITE_DESCRIPTOR_SET = 35
 ST_COMMAND_POOL_CREATE_INFO = 39
 ST_COMMAND_BUFFER_ALLOCATE_INFO = 40
 ST_COMMAND_BUFFER_BEGIN_INFO = 42
+ST_MEMORY_BARRIER = 10
 
 # ---------------------------------------------------------------- structs --
 
@@ -141,6 +153,10 @@ class VkCommandBufferBeginInfo(C.Structure):
 
 class VkBufferCopy(C.Structure):
     _fields_ = [("srcOffset", c_uint64), ("dstOffset", c_uint64), ("size", c_uint64)]
+
+class VkMemoryBarrier(C.Structure):
+    _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("srcAccessMask", c_uint32),
+                ("dstAccessMask", c_uint32)]
 
 class VkShaderModuleCreateInfo(C.Structure):
     _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("flags", c_uint32),
@@ -253,6 +269,8 @@ vkBeginCommandBuffer = _vk("vkBeginCommandBuffer", _v + _v)
 vkResetCommandBuffer = _vk("vkResetCommandBuffer", _v + [c_uint32])
 vkEndCommandBuffer = _vk("vkEndCommandBuffer", _v)
 vkCmdCopyBuffer = _vk("vkCmdCopyBuffer", _v + _v + _v + [c_uint32] + _v, _N)
+vkCmdPipelineBarrier = _vk("vkCmdPipelineBarrier",
+                           _v + [c_uint32, c_uint32, c_uint32] + [c_uint32] + _v + [c_uint32] + _v + [c_uint32] + _v, _N)
 vkCmdBindPipeline = _vk("vkCmdBindPipeline", _v + [c_uint32] + _v, _N)
 vkCmdBindDescriptorSets = _vk("vkCmdBindDescriptorSets", _v + [c_uint32] + _v + [c_uint32, c_uint32] + _v + [c_uint32] + _v, _N)
 vkCmdDispatch = _vk("vkCmdDispatch", _v + [c_uint32, c_uint32, c_uint32], _N)
@@ -394,7 +412,20 @@ class VkRt:
         self.cbs, self._cb_active = cbs, False
         # self._slot is the ring slot the active command buffer belongs to (or the next one
         # to begin). self._inflight[i]: fence i was submitted and has not been waited on.
-        self._slot, self._inflight = 0, [False] * RING
+        # self._ncmd: commands recorded in the active command buffer.
+        self._slot, self._inflight, self._ncmd = 0, [False] * RING, 0
+        self._cb_has_dispatch, self._nkernels, self._in_kernel = False, 0, False
+        # the NV 550 driver does not make one dispatch's stores visible to the next
+        # dispatch's loads within a single command buffer; an explicit compute->compute
+        # memory barrier between dispatches in the same cb restores ordering. VK_BARRIER=0
+        # disables it (for A/B diagnosis).
+        self._barrier = os.environ.get("VK_BARRIER", "1") == "1"
+        # RADV on this APU does not honor in-cb visibility even with that barrier (stale
+        # reads for both compute->compute and compute->transfer within one cb; a write
+        # only becomes visible across the next submit's fence). There we give every kernel
+        # and every copy its own command buffer (flush on bind_pipeline / cmd_copy) and let
+        # the _async=False per-submit fence wait serialize them: the pre-batching behavior.
+        self._per_kernel_submit = self.vendor == 0x1002
 
         self.fences = (c_void_p * RING)()
         for i in range(RING):
@@ -569,37 +600,60 @@ class VkRt:
             _check("vkResetCommandBuffer", vkResetCommandBuffer(self.cbs[self._slot], 0))
             bi = VkCommandBufferBeginInfo(sType=ST_COMMAND_BUFFER_BEGIN_INFO)
             _check("vkBeginCommandBuffer", vkBeginCommandBuffer(self.cbs[self._slot], C.byref(bi)))
-            self._cb_active = True
+            self._cb_active, self._ncmd, self._cb_has_dispatch, self._nkernels, self._in_kernel = True, 0, False, 0, False
+
+    def _begin_cmd(self):
+        # start recording one command in the current cb. The command-count backstop only
+        # fires between kernels (a kernel's bind/bdesc/dispatch must stay in one cb); the
+        # kernel-count flush happens in cmd_bind_pipeline, before the record.
+        self._ensure_cb()
+        if self._ncmd >= CB_FLUSH_MAX and not self._in_kernel: self.submit()
+        self._ncmd += 1
 
     def cmd_copy(self, dst, src, size=None, src_off=0, dst_off=0):
         n = size if size is not None else min(dst.size, src.size)
-        self._ensure_cb()
+        if self._per_kernel_submit: self.submit()  # this copy must not share a cb with a dispatch
+        self._begin_cmd()
         cp = VkBufferCopy(srcOffset=src_off, dstOffset=dst_off, size=n)
         vkCmdCopyBuffer(self.cbs[self._slot], _handle(src), _handle(dst), 1, C.byref(cp))
 
     def cmd_bind_pipeline(self, pipeline):
+        # a kernel starts here; flush the pending cb at a kernel boundary (RADV: every
+        # kernel, others: every CB_FLUSH_KERNELS) so this kernel's commands stay together
+        if self._cb_active and (self._per_kernel_submit or self._nkernels >= CB_FLUSH_KERNELS):
+            self.submit()
         self._ensure_cb()
         vkCmdBindPipeline(self.cbs[self._slot], VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle)
+        self._ncmd += 1
+        self._nkernels += 1
+        self._in_kernel = True
 
     def cmd_bind_descriptor_sets(self, pipeline_or_layout, desc_set):
         layout = pipeline_or_layout.layout if hasattr(pipeline_or_layout, "layout") else pipeline_or_layout
-        self._ensure_cb()
+        self._begin_cmd()
         # pDescriptorSets is a pointer to an array of set handles, not the handle itself
         sets = (c_void_p * 1)(_handle(desc_set))
         vkCmdBindDescriptorSets(self.cbs[self._slot], VK_PIPELINE_BIND_POINT_COMPUTE, layout,
                                 0, 1, sets, 0, None)
 
     def cmd_dispatch(self, x, y, z):
-        self._ensure_cb()
+        self._begin_cmd()
+        # NV 550 needs an explicit barrier to see the previous in-cb dispatch's stores
+        if self._barrier and self._cb_has_dispatch:
+            mb = VkMemoryBarrier(sType=ST_MEMORY_BARRIER, srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,
+                                 dstAccessMask=VK_ACCESS_SHADER_READ_BIT)
+            vkCmdPipelineBarrier(self.cbs[self._slot], VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_COMPUTE_BIT,
+                                 0, 1, C.cast(C.byref(mb), c_void_p), 0, None, 0, None)
         vkCmdDispatch(self.cbs[self._slot], x, y, z)
+        self._cb_has_dispatch, self._in_kernel = True, False
 
     def submit(self, wait:bool=False):
-        """End the recorded command buffer and submit it with its ring slot's fence.
-        wait=False returns immediately (the work is in flight); wait=True blocks until
-        the just-submitted fence signals (a full queue drain of this slot's work).
-        On drivers that need it (self._async is False, e.g. RADV on this APU) every
-        submit waits on its fence: the next in-order dispatch must not start before
-        this submit's stores are visible, so the ring never runs deeper than one."""
+        """End the pending command buffer and submit it with its ring slot's fence; a
+        no-op when nothing is pending. wait=False returns immediately (the work is in
+        flight); wait=True blocks until the just-submitted fence signals. On drivers
+        that need it (self._async is False, e.g. RADV on this APU) every submit waits
+        on its fence: the next in-order dispatch must not start before this submit's
+        stores are visible, so the ring never runs deeper than one."""
         if not self._cb_active:
             return VK_SUCCESS
         i = self._slot
@@ -618,8 +672,10 @@ class VkRt:
         return VK_SUCCESS
 
     def synchronize(self, timeout_ms:int|None=None):
-        """Wait for every in-flight submit (all pending fences in the ring)."""
+        """Flush the pending command buffer (if any), then wait for every in-flight
+        submit (all pending fences in the ring)."""
         timeout_ns = (timeout_ms if timeout_ms is not None else 30000) * 1_000_000
+        self.submit(wait=False)
         for i in range(RING):
             if self._inflight[i]: self._wait_fence(i, timeout_ns)
 
@@ -628,6 +684,7 @@ class VkRt:
     def close(self):
         if not getattr(self, "device", None):
             return
+        self.submit(wait=False)  # a pending (unsubmitted) command buffer would be dropped
         _check("vkDeviceWaitIdle", vkDeviceWaitIdle(self.device))
         for b in self._buffers:
             if b._mapped is not None:

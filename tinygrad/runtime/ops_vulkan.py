@@ -34,8 +34,10 @@ def _pack_params(vals:tuple[int|float, ...], var_dts:tuple[DType, ...]) -> bytes
 
 class VulkanAllocator(Allocator):
   # a few host-visible staging buffers, kept mapped, reused for every host<->device copy.
-  # safe to reuse without per-buffer tracking: _copyin syncs the device first (no in-flight
-  # use), _copyout waits on its fence before the CPU reads, and queue order separates uses.
+  # safe to reuse without per-buffer tracking: kernels accumulate in the pending command
+  # buffer (submitted at synchronize/copy boundaries), so a LRU-reused buffer may still be
+  # touched by pending or in-flight work; _copyin drains the device first, _copyout appends
+  # its D2H after the pending kernels and waits on its fence before the CPU reads.
   STAGING_MAX = 4
   def __init__(self, dev:Compiled):
     super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
@@ -62,16 +64,18 @@ class VulkanAllocator(Allocator):
     self._staging_bufs.append(s)
     return s
   def _copyin(self, dest:VulkanBuffer, src:memoryview):
-    # the LRU-reused dest may still be written by in-flight kernels; drain before reusing it
+    # the LRU-reused dest may still be read/written by pending (unsubmitted) or in-flight
+    # kernels; drain everything before reusing it
     self.dev.synchronize()
     st = self._staging(src.nbytes)
     st.map()[0:src.nbytes] = src.cast('B')
     self.dev.rt.cmd_copy(dest.vbuf, st, src.nbytes, dst_off=dest.offset)
-    self.dev.rt.submit()  # async H2D, ordered after the drain on the same queue
+    self.dev.rt.submit()  # async H2D in its own cb; same-queue order places it before later kernels
   def _copyout(self, dest:memoryview, src:VulkanBuffer):
     st = self._staging(dest.nbytes)
+    # the D2H is recorded after any pending kernels in the current cb, so it runs after them
     self.dev.rt.cmd_copy(st, src.vbuf, dest.nbytes, src_off=src.offset)
-    self.dev.rt.submit(wait=True)  # D2H runs after every in-flight kernel (same queue); wait before the CPU reads
+    self.dev.rt.submit(wait=True)  # wait before the CPU reads staging
     dest[:] = bytes(st.map()[0:dest.nbytes])
   def _map(self, buf): raise RuntimeError("VULKAN cross-device map not supported")
 
@@ -122,7 +126,11 @@ class VulkanProgram(Program['VulkanDevice']):
     self.dev.rt.cmd_bind_pipeline(pipeline)
     self.dev.rt.cmd_bind_descriptor_sets(pipeline, desc_set)
     self.dev.rt.cmd_dispatch(*global_size)
-    self.dev.rt.submit(wait=wait)  # async by default; tinygrad syncs at .item()/.numpy() points
+    # record-only by default: the dispatch stays in the pending command buffer and is
+    # submitted at the next boundary (synchronize / _copyin / _copyout / wait=True launch).
+    # vals are per-program compile-time constants, so the UBO write above stays valid while
+    # earlier launches of this program are still pending.
+    if wait: self.dev.rt.submit(wait=True)
     return None
 
 class VulkanDevice(Compiled):
@@ -132,8 +140,8 @@ class VulkanDevice(Compiled):
     super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram,
                      arch="radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
   def synchronize(self, timeout:int|None=None):
-    # no timeline on this backend (work is not signaled into dev.timeline): wait on the
-    # submit ring's fences instead
+    # no timeline on this backend (work is not signaled into dev.timeline): flush the
+    # pending command buffer, then wait on the submit ring's fences
     self.rt.synchronize(timeout)
   def finalize(self):
     try: super().finalize()
