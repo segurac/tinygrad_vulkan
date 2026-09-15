@@ -148,6 +148,17 @@ def f2f_store(st, idx, val, fr:DType, to:DType):
   if (n:=val.max_numel()) == 1: return st.replace(src=(idx, f2f(val.bitcast(f2f_dt[to]), to, fr)))
   return UOp.group(*(st.replace(src=(reindex(idx, i, 1), f2f(val.index(i).bitcast(f2f_dt[to]), to, fr))) for i in range(n)))
 
+def f2f_round(v:UOp, fr:DType, to:DType) -> UOp:
+  # RNE-round a wide-dtype value to the emulated dtype's grid, returning it in the wide dtype
+  return f2f(f2f(v.bitcast(f2f_dt[to]), to, fr), fr, to)
+
+def f2f_grid(v:UOp, ctx) -> UOp:
+  # bring an emulated-dtype value onto the emulated grid: decomp it to the wide dtype, then RNE-round it
+  fr, to = ctx
+  if v.dtype != fr: return v
+  if v.op is Ops.CONST: return f2f_round(UOp.const(v.arg, to), fr, to)  # a bare const is not decomped; lift it to the wide dtype
+  return f2f_round(graph_rewrite(v, pm_float_decomp, ctx=ctx, bottom_up=True), fr, to)
+
 # tag is the 32-bit word this node becomes - (0 for the low word, 1 for the high, the dtype the consumer wants)
 pm_long_decomp: PatternMatcher = PatternMatcher([
   # the decomp's own bottom-up rewrite can mint bare consts mid-flight: word splitting commits them at the long sibling's dtype
@@ -201,6 +212,11 @@ pm_float_decomp: PatternMatcher = PatternMatcher([
    f2f(x.bitcast(f2f_dt[ctx[0]]), ctx[0], ctx[1]) if bc.dtype == ctx[0] else None),
   (UPat(Ops.CAST, dtypes.floats, src=(UPat.var("val"),), name="x"), lambda ctx,x,val:
    f2f_clamp(val.cast(ctx[1]), ctx[0]) if x.dtype == ctx[0] else None),
+  # a comparison is the one place a raw (off-grid) value meets a buffered (on-grid) one: RNE both operands
+  # so `x == y` / `x < y` see the same grid a native emulated-dtype device would. in stage 0 the operands are
+  # still emulated-dtype, so decomp+round them here before the bottom-up pass rewrites them raw
+  (UPat((Ops.CMPEQ, Ops.CMPNE, Ops.CMPLT), src=[UPat.var("a"), UPat.var("b")], name="x"), lambda ctx,a,b,x:
+     x.replace(src=(f2f_grid(a, ctx), f2f_grid(b, ctx))) if (a.dtype == ctx[0] or b.dtype == ctx[0]) else None),
   # NOT AFTER: its src[0] is storage, casting it to the emulated dtype is a type lie; its dtype follows
   # the buffer rewrite and the load/store arms own the conversion
   (UPat(GroupOp.All-GroupOp.Defines-{Ops.CAST, Ops.BITCAST, Ops.CONST, Ops.AFTER}, dtypes.floats, name="x"), lambda ctx,x:
