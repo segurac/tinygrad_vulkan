@@ -352,6 +352,13 @@ class SPIRVRenderer(LVPRenderer):
 
   def __init__(self, target:Target = Target(arch="x86_64")): super().__init__(target)
 
+  # The zink exporter omits the SPIR-V 16BitStorage capability and NV (550) silently miscompiles
+  # 16-bit float ops (Llama-3.2-1B in bf16 produced garbage); RADV executes native f16/bf16
+  # correctly. Off RADV, emulate both 16-bit floats in fp32 with uint16 storage (f2f decomp).
+  def supported_dtypes(self):
+    if self.target.arch == "radv": return super().supported_dtypes()
+    return {d for d in super().supported_dtypes() if d not in (dtypes.half, dtypes.bfloat16)}
+
   def _bo_var(self, b, mode, elem_dt, n, name, binding, driver_location=0):
     fields = (mesa.struct_glsl_struct_field * 1)()
     fields[0].type = mesa.glsl_array_type(glsl_type(elem_dt), n, 0)

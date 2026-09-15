@@ -98,7 +98,6 @@ def rne(v: UOp, s) -> UOp: return shr(v, s) + ((shr(v, s - 1) & 1) & ((v & ((1 <
 
 def f2f(v, fr:DType, to:DType, sat=True):
   fs, fb, (fe, fm), ts, tb, (te, tm) = fr.bitsize, exponent_bias(fr), dtypes.finfo(fr), to.bitsize, exponent_bias(to), dtypes.finfo(to)
-  # NB: denormals are zero!
   if fe <= te and fm < tm:
     sign, nosign = shl((v & shl(1, fs-1)).cast(f2f_dt[to]), ts - fs), (v & (shl(1, fs-1) - 1)).cast(f2f_dt[to])
     exp, norm = shr(nosign, fm), shl(nosign, tm - fm) + shl(tb - fb, tm)
@@ -110,7 +109,15 @@ def f2f(v, fr:DType, to:DType, sat=True):
       return fnuz_nan.where(qnan, sign | (exp < max(fb - tb, 0) + 1).where(0, norm)).bitcast(to)
     # fp8e4m3 has only one nan
     is_nan = (nosign.eq(shl(1, fm + fe) - 1) if fr == dtypes.fp8e4m3 else exp.eq(shl(1, fe) - 1))
-    return (sign | exp.eq(0).where(0, is_nan.where(nan, norm))).bitcast(to)
+    # a denormal is exact in the wider target: an integer mantissa times a power of two
+    if (s:=tb + tm - fb - fm) >= 0 and (2.0 ** (1 - fb - fm)) * (2 ** fm - 1) < 2.0 ** (1 - tb):
+      # the product is still denormal in the target (e.g. bfloat16 -> float): emit the bit
+      # pattern sign | (m << s) directly, denormal f32 arithmetic is broken on some drivers
+      return (sign | exp.eq(0).where(nosign.eq(0).where(UOp.const(0, f2f_dt[to]), shl(nosign, s)),
+                                     is_nan.where(nan, norm))).bitcast(to)
+    denorm = nosign.cast(to) * UOp.const(2.0 ** (1 - fb - fm), to)
+    body = exp.eq(0).where(nosign.eq(0).where(UOp.const(0.0, to), denorm), is_nan.where(nan, norm).bitcast(to))
+    return sign.ne(0).where(-body, body)
   elif fe >= te and fm > tm:
     v = f2f_clamp(v.bitcast(fr), to, sat).bitcast(f2f_dt[fr])
     sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
@@ -194,8 +201,10 @@ pm_float_decomp: PatternMatcher = PatternMatcher([
    f2f(x.bitcast(f2f_dt[ctx[0]]), ctx[0], ctx[1]) if bc.dtype == ctx[0] else None),
   (UPat(Ops.CAST, dtypes.floats, src=(UPat.var("val"),), name="x"), lambda ctx,x,val:
    f2f_clamp(val.cast(ctx[1]), ctx[0]) if x.dtype == ctx[0] else None),
-  (UPat(GroupOp.All-GroupOp.Defines-{Ops.CAST, Ops.BITCAST, Ops.CONST}, dtypes.floats, name="x"), lambda ctx,x:
-   UOp(x.op, src=tuple(s.cast(ctx[1]) if s.dtype == ctx[0] else s for s in x.src), arg=x.arg, tag=x.tag) if x.dtype == ctx[0] else None),
+  # NOT AFTER: its src[0] is storage, casting it to the emulated dtype is a type lie; its dtype follows
+  # the buffer rewrite and the load/store arms own the conversion
+  (UPat(GroupOp.All-GroupOp.Defines-{Ops.CAST, Ops.BITCAST, Ops.CONST, Ops.AFTER}, dtypes.floats, name="x"), lambda ctx,x:
+    UOp(x.op, src=tuple(s.cast(ctx[1]) if s.dtype == ctx[0] else s for s in x.src), arg=x.arg, tag=x.tag) if x.dtype == ctx[0] else None),
   (UPat(Ops.STORE, src=(UPat.var("idx"), UPat(Ops.BITCAST, dtypes.floats, name="val")), name='st'), lambda ctx,st,idx,val:
    st.replace(src=(idx, val.src[0].bitcast(f2f_dt[ctx[0]]))) if val.dtype == ctx[0] and idx.tag == ctx[0] else None),
   (UPat(Ops.STORE, src=(UPat.var("idx").or_casted(), UPat.var("val", dtypes.floats)), name='st'), lambda ctx,st,idx,val:
