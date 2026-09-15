@@ -8,7 +8,8 @@ from tinygrad.renderer.nir import SPIRVRenderer
 from tinygrad.runtime.support import vulkan_rt as vkrt
 
 class VulkanBuffer:
-  # a view into a host-visible VkBuffer; the descriptor addresses (handle, offset)
+  # a view into a VkBuffer (device-local data, host-visible params/staging);
+  # the descriptor addresses (handle, offset)
   __slots__ = ("vbuf", "offset")
   def __init__(self, vbuf, offset:int=0): self.vbuf, self.offset = vbuf, offset
   @property
@@ -32,20 +33,46 @@ def _pack_params(vals:tuple[int|float, ...], var_dts:tuple[DType, ...]) -> bytes
   return bytes(u8)
 
 class VulkanAllocator(Allocator):
-  def __init__(self, dev:Compiled): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
+  # a few host-visible staging buffers, kept mapped, reused for every host<->device copy.
+  # safe to reuse without per-buffer tracking: _copyin syncs the device first (no in-flight
+  # use), _copyout waits on its fence before the CPU reads, and queue order separates uses.
+  STAGING_MAX = 4
+  def __init__(self, dev:Compiled):
+    super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
+    self._staging_bufs:list = []
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.external_ptr is not None: raise RuntimeError("VULKAN does not support external_ptr")
-    vbuf = self.dev.rt.buffer(size, host_visible=True)
-    mapped = vbuf.map()
-    return BufferStorage(VulkanBuffer(vbuf, 0), None, MMIOInterface(mv_address(mapped), size, fmt='B'))
+    if options.host:
+      vbuf = self.dev.rt.buffer(size, host_visible=True)
+      return BufferStorage(VulkanBuffer(vbuf, 0), None, MMIOInterface(mv_address(vbuf.map()), size, fmt='B'))
+    # device-local: on a dGPU this is VRAM (the host-visible heap is a small ReBAR window),
+    # on an APU it is the same unified memory, on llvmpipe rt.buffer falls back to host memory
+    return BufferStorage(VulkanBuffer(self.dev.rt.buffer(size, host_visible=False), 0), None, None)
   def _free(self, storage:BufferStorage, options:BufferSpec): pass  # VkBuffers live until rt.close(); the LRU cache reuses them
   def _offset(self, buf:VulkanBuffer, size:int, offset:int) -> VulkanBuffer: return VulkanBuffer(buf.vbuf, buf.offset + offset)
+  def _staging(self, nbytes:int):
+    if (s := min((b for b in self._staging_bufs if b.size >= nbytes), key=lambda b: b.size, default=None)) is not None: return s
+    if len(self._staging_bufs) >= self.STAGING_MAX:  # drop the smallest; it may still be in flight
+      self.dev.rt.synchronize()
+      smallest = min(self._staging_bufs, key=lambda b: b.size)
+      self._staging_bufs.remove(smallest)
+      self.dev.rt.free_buffer(smallest)
+    s = self.dev.rt.buffer(nbytes, host_visible=True)
+    s.map()
+    self._staging_bufs.append(s)
+    return s
   def _copyin(self, dest:VulkanBuffer, src:memoryview):
+    # the LRU-reused dest may still be written by in-flight kernels; drain before reusing it
     self.dev.synchronize()
-    dest.vbuf.map()[dest.offset:dest.offset+src.nbytes] = src.cast('B')
+    st = self._staging(src.nbytes)
+    st.map()[0:src.nbytes] = src.cast('B')
+    self.dev.rt.cmd_copy(dest.vbuf, st, src.nbytes, dst_off=dest.offset)
+    self.dev.rt.submit()  # async H2D, ordered after the drain on the same queue
   def _copyout(self, dest:memoryview, src:VulkanBuffer):
-    self.dev.synchronize()
-    dest[:] = bytes(src.vbuf.map()[src.offset:src.offset+dest.nbytes])
+    st = self._staging(dest.nbytes)
+    self.dev.rt.cmd_copy(st, src.vbuf, dest.nbytes, src_off=src.offset)
+    self.dev.rt.submit(wait=True)  # D2H runs after every in-flight kernel (same queue); wait before the CPU reads
+    dest[:] = bytes(st.map()[0:dest.nbytes])
   def _map(self, buf): raise RuntimeError("VULKAN cross-device map not supported")
 
 class VulkanProgram(Program['VulkanDevice']):
@@ -95,7 +122,7 @@ class VulkanProgram(Program['VulkanDevice']):
     self.dev.rt.cmd_bind_pipeline(pipeline)
     self.dev.rt.cmd_bind_descriptor_sets(pipeline, desc_set)
     self.dev.rt.cmd_dispatch(*global_size)
-    self.dev.rt.submit()
+    self.dev.rt.submit(wait=wait)  # async by default; tinygrad syncs at .item()/.numpy() points
     return None
 
 class VulkanDevice(Compiled):
@@ -104,6 +131,10 @@ class VulkanDevice(Compiled):
     self.rt = vkrt.VkRt()
     super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram,
                      arch="radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
+  def synchronize(self, timeout:int|None=None):
+    # no timeline on this backend (work is not signaled into dev.timeline): wait on the
+    # submit ring's fences instead
+    self.rt.synchronize(timeout)
   def finalize(self):
     try: super().finalize()
     except RuntimeError as e: print(f"VULKAN synchronization failed before finalizing: {e}")

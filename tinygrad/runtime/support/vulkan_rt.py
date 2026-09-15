@@ -2,8 +2,8 @@
 
 Struct layouts match Vulkan-Headers v1.4.305 (extra/vulkan/include/vulkan/vulkan_core.h).
 Only what a compute device needs: one queue family, buffers (mapped or
-device-local + staging), one reusable command buffer, compute pipelines,
-storage/uniform buffer descriptors, one fence.
+device-local + staging), a ring of (command buffer, fence) pairs so submits can be
+async and pipelined, compute pipelines, storage/uniform buffer descriptors.
 """
 import ctypes as C
 import glob
@@ -46,6 +46,10 @@ _RESULTS = {
     -15: "VK_ERROR_INCOMPATIBLE_DRIVER", -16: "VK_ERROR_FEATURE_NOT_PRESENT",
     -18: "VK_ERROR_FORMAT_NOT_SUPPORTED", -1000000001: "VK_ERROR_UNKNOWN",
 }
+
+# in-flight submits allowed: the (command buffer, fence) ring depth. submit() only blocks
+# (backpressure) when it wraps around to a slot whose fence has not signaled yet.
+RING = 8
 
 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 1
 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 2
@@ -355,6 +359,12 @@ class VkRt:
         self.phys_device = amdev
         self.device_name, self.driver_version, self.vendor, self.device_id = props[5], props[1], props[2], props[3]
         self.api_version = props[0]
+        # RADV on this APU does not make a submit's stores visible before the next in-order
+        # dispatch may start: with 3+ cbs in flight, a reduce kernel reads stale partial sums
+        # from the previous dispatch's temp buffer. It is bit-exact only when every submit's
+        # fence is waited on before the next submit (see submit). NV550 and llvmpipe are
+        # correct at full async. VK_ASYNC=0/1 overrides the per-vendor default.
+        self._async = os.environ.get("VK_ASYNC", "0" if self.vendor == 0x1002 else "1") == "1"
 
         mp = VkPhysicalDeviceMemoryProperties()
         vkGetPhysicalDeviceMemoryProperties(amdev, C.byref(mp))
@@ -378,15 +388,20 @@ class VkRt:
         _check("vkCreateCommandPool", vkCreateCommandPool(dev, C.byref(cpci), None, C.byref(pool)))
         self.cmd_pool = pool
         cba = VkCommandBufferAllocateInfo(sType=ST_COMMAND_BUFFER_ALLOCATE_INFO, commandPool=pool,
-                                          level=VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=1)
-        cb = c_void_p()
-        _check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(dev, C.byref(cba), C.byref(cb)))
-        self.cmd_buf, self._cb_active = cb, False
+                                           level=VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=RING)
+        cbs = (c_void_p * RING)()
+        _check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(dev, C.byref(cba), cbs))
+        self.cbs, self._cb_active = cbs, False
+        # self._slot is the ring slot the active command buffer belongs to (or the next one
+        # to begin). self._inflight[i]: fence i was submitted and has not been waited on.
+        self._slot, self._inflight = 0, [False] * RING
 
-        fci = VkFenceCreateInfo(sType=ST_FENCE_CREATE_INFO)
-        fence = c_void_p()
-        _check("vkCreateFence", vkCreateFence(dev, C.byref(fci), None, C.byref(fence)))
-        self.fence, self._fence_signaled = fence, False
+        self.fences = (c_void_p * RING)()
+        for i in range(RING):
+            fci = VkFenceCreateInfo(sType=ST_FENCE_CREATE_INFO)
+            out = c_void_p()
+            _check("vkCreateFence", vkCreateFence(dev, C.byref(fci), None, C.byref(out)))
+            self.fences[i] = out
 
         self._buffers, self._modules, self._dsls, self._pipelines = [], [], [], []
 
@@ -443,6 +458,16 @@ class VkRt:
         b = VBuffer(self, buf, mem, size, host_visible)
         self._buffers.append(b)
         return b
+
+    def free_buffer(self, vbuf:VBuffer):
+        # data buffers are never freed (the LRU reuses them); this exists for the
+        # allocator's staging pool to drop a buffer it is growing past
+        if vbuf._mapped is not None:
+            vkUnmapMemory(self.device, vbuf.mem)
+            vbuf._mapped, vbuf._arr = None, None
+        vkDestroyBuffer(self.device, vbuf.handle, None)
+        vkFreeMemory(self.device, vbuf.mem, None)
+        self._buffers.remove(vbuf)
 
     # -- shaders / pipelines / descriptors --
 
@@ -531,49 +556,72 @@ class VkRt:
 
     # -- command recording / submit --
 
+    def _wait_fence(self, i, timeout_ns=30_000_000_000):
+        _check("vkWaitForFences", vkWaitForFences(self.device, 1, C.cast((c_void_p * 1)(self.fences[i]), c_void_p),
+                                                  1, timeout_ns))
+        self._inflight[i] = False
+
     def _ensure_cb(self):
         if not self._cb_active:
+            # backpressure: wrapping back to a slot whose submit is still in flight; its
+            # command buffer must be idle before it can be reset and re-recorded
+            if self._inflight[self._slot]: self._wait_fence(self._slot)
+            _check("vkResetCommandBuffer", vkResetCommandBuffer(self.cbs[self._slot], 0))
             bi = VkCommandBufferBeginInfo(sType=ST_COMMAND_BUFFER_BEGIN_INFO)
-            _check("vkBeginCommandBuffer", vkBeginCommandBuffer(self.cmd_buf, C.byref(bi)))
+            _check("vkBeginCommandBuffer", vkBeginCommandBuffer(self.cbs[self._slot], C.byref(bi)))
             self._cb_active = True
 
-    def cmd_copy(self, dst, src, size=None):
+    def cmd_copy(self, dst, src, size=None, src_off=0, dst_off=0):
         n = size if size is not None else min(dst.size, src.size)
         self._ensure_cb()
-        cp = VkBufferCopy(srcOffset=0, dstOffset=0, size=n)
-        vkCmdCopyBuffer(self.cmd_buf, _handle(src), _handle(dst), 1, C.byref(cp))
+        cp = VkBufferCopy(srcOffset=src_off, dstOffset=dst_off, size=n)
+        vkCmdCopyBuffer(self.cbs[self._slot], _handle(src), _handle(dst), 1, C.byref(cp))
 
     def cmd_bind_pipeline(self, pipeline):
         self._ensure_cb()
-        vkCmdBindPipeline(self.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle)
+        vkCmdBindPipeline(self.cbs[self._slot], VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle)
 
     def cmd_bind_descriptor_sets(self, pipeline_or_layout, desc_set):
         layout = pipeline_or_layout.layout if hasattr(pipeline_or_layout, "layout") else pipeline_or_layout
         self._ensure_cb()
         # pDescriptorSets is a pointer to an array of set handles, not the handle itself
         sets = (c_void_p * 1)(_handle(desc_set))
-        vkCmdBindDescriptorSets(self.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, layout,
+        vkCmdBindDescriptorSets(self.cbs[self._slot], VK_PIPELINE_BIND_POINT_COMPUTE, layout,
                                 0, 1, sets, 0, None)
 
     def cmd_dispatch(self, x, y, z):
         self._ensure_cb()
-        vkCmdDispatch(self.cmd_buf, x, y, z)
+        vkCmdDispatch(self.cbs[self._slot], x, y, z)
 
-    def submit(self):
-        """End the recorded command buffer, submit, and wait (30 s fence)."""
+    def submit(self, wait:bool=False):
+        """End the recorded command buffer and submit it with its ring slot's fence.
+        wait=False returns immediately (the work is in flight); wait=True blocks until
+        the just-submitted fence signals (a full queue drain of this slot's work).
+        On drivers that need it (self._async is False, e.g. RADV on this APU) every
+        submit waits on its fence: the next in-order dispatch must not start before
+        this submit's stores are visible, so the ring never runs deeper than one."""
         if not self._cb_active:
             return VK_SUCCESS
-        _check("vkEndCommandBuffer", vkEndCommandBuffer(self.cmd_buf))
-        if self._fence_signaled:
-            _check("vkResetFences", vkResetFences(self.device, 1, C.byref(self.fence)))
-        si = VkSubmitInfo(sType=ST_SUBMIT_INFO, commandBufferCount=1,
-                          pCommandBuffers=_p(self.cmd_buf))
-        _check("vkQueueSubmit", vkQueueSubmit(self.queue, 1, C.byref(si), self.fence))
-        _check("vkWaitForFences", vkWaitForFences(self.device, 1, C.byref(self.fence), 1, 30_000_000_000))
-        self._fence_signaled = True
-        _check("vkResetCommandBuffer", vkResetCommandBuffer(self.cmd_buf, 0))
+        i = self._slot
+        _check("vkEndCommandBuffer", vkEndCommandBuffer(self.cbs[i]))
+        if not self._inflight[i]:  # fence was signaled by its previous use; reset before reuse
+            _check("vkResetFences", vkResetFences(self.device, 1, C.cast((c_void_p * 1)(self.fences[i]), c_void_p)))
+        cbs1 = (c_void_p * 1)(self.cbs[i])
+        si = VkSubmitInfo(sType=ST_SUBMIT_INFO, commandBufferCount=1, pCommandBuffers=C.cast(cbs1, c_void_p))
+        # NOTE: these drivers (NV 550, RADV) treat the pFence arg as the fence object itself;
+        # a true VkFence* (pointer to a slot holding the handle) makes both of them crash
+        _check("vkQueueSubmit", vkQueueSubmit(self.queue, 1, C.byref(si), self.fences[i]))
+        self._inflight[i] = True
+        if wait or not self._async: self._wait_fence(i)
+        self._slot = (i + 1) % RING
         self._cb_active = False
         return VK_SUCCESS
+
+    def synchronize(self, timeout_ms:int|None=None):
+        """Wait for every in-flight submit (all pending fences in the ring)."""
+        timeout_ns = (timeout_ms if timeout_ms is not None else 30000) * 1_000_000
+        for i in range(RING):
+            if self._inflight[i]: self._wait_fence(i, timeout_ns)
 
     # -- teardown --
 
@@ -595,9 +643,10 @@ class VkRt:
         for d in self._dsls:
             vkDestroyDescriptorPool(self.device, d.pool, None)
             vkDestroyDescriptorSetLayout(self.device, d.layout, None)
-        vkFreeCommandBuffers(self.device, self.cmd_pool, 1, C.byref(self.cmd_buf))
+        vkFreeCommandBuffers(self.device, self.cmd_pool, RING, C.cast(self.cbs, c_void_p))
         vkDestroyCommandPool(self.device, self.cmd_pool, None)
-        vkDestroyFence(self.device, self.fence, None)
+        for i in range(RING):
+            vkDestroyFence(self.device, self.fences[i], None)
         vkDestroyDevice(self.device, None)
         vkDestroyInstance(self.instance, None)
         self.device = c_void_p(None)
