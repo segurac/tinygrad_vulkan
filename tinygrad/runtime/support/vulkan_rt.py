@@ -339,17 +339,19 @@ class VkRt:
 
         # RADV reports deviceType=CPU on this APU and the loader trampoline for
         # vkGetPhysicalDeviceQueueFamilyProperties segfaults, so pick by vendorID
-        # and hardcode queue family 0 (GRAPHICS|COMPUTE|TRANSFER on RADV).
-        amdev: c_void_p | None = None
-        props: tuple[int, int, int, int, int, str] | None = None
+        # and hardcode queue family 0 (GRAPHICS|COMPUTE|TRANSFER on RADV/NV).
+        # VK_VENDOR: space-separated hex vendor IDs (default AMD 0x1002 + NVIDIA 0x10DE).
+        # VK_DEVICE_INDEX: which matching physical device to use (default 0).
+        wanted = {int(v, 16) for v in os.environ.get("VK_VENDOR", "1002 10de").split()}
+        want_idx = int(os.environ.get("VK_DEVICE_INDEX", "0"))
+        candidates: list[tuple[c_void_p, tuple[int, int, int, int, int, str]]] = []
         for e in devs:
             d = c_void_p(e)
             p = self._props(d)
-            if p[2] == 0x1002:
-                amdev, props = d, p
-                break
-        if amdev is None or props is None:
-            raise RuntimeError("no AMD (vendor 0x1002) physical device found")
+            if p[2] in wanted: candidates.append((d, p))
+        if want_idx >= len(candidates):
+            raise RuntimeError(f"VK_DEVICE_INDEX={want_idx} but only {len(candidates)} device(s) with vendor in {sorted(wanted)}")
+        amdev, props = candidates[want_idx]
         self.phys_device = amdev
         self.device_name, self.driver_version, self.vendor, self.device_id = props[5], props[1], props[2], props[3]
         self.api_version = props[0]
@@ -408,30 +410,32 @@ class VkRt:
             req = VkMemoryRequirements()
             vkGetBufferMemoryRequirements(self.device, buf, C.byref(req))
             mp = self._mem_props
-            idx = None
+            hvhc = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            # (rank, memtype): host-visible VRAM (ReBAR window) preferred, then sys RAM;
+            # rank 1 = "anything usable" fallback
+            cands: list[tuple[int, int]] = []
             for i in range(mp.memoryTypeCount):
                 if not (req.memoryTypeBits >> i) & 1:
                     continue
                 pf = mp.memoryTypes[i].propertyFlags
                 if host_visible:
-                    if pf & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == \
-                            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT):
-                        idx = i
-                        break
+                    if pf & hvhc == hvhc:
+                        cands.append((0 if pf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT else 1, i))
                 elif pf & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:
+                    cands.append((0, i))
+            if not cands and not host_visible:  # no device-local heap: take anything usable
+                cands = [(1, i) for i in range(mp.memoryTypeCount) if (req.memoryTypeBits >> i) & 1]
+            cands.sort()
+            # try in rank order; a full ReBAR maps all VRAM, a partial window (256 MB) fills up fast
+            mem, err, idx = c_void_p(), VK_ERROR_OUT_OF_DEVICE_MEMORY, None
+            for _, i in cands:
+                mai = VkMemoryAllocateInfo(sType=ST_MEMORY_ALLOCATE_INFO, allocationSize=req.size, memoryTypeIndex=i)
+                if (r := vkAllocateMemory(self.device, C.byref(mai), None, C.byref(mem))) == VK_SUCCESS:
                     idx = i
                     break
-            if idx is None and not host_visible:  # no device-local heap: take anything usable
-                for i in range(mp.memoryTypeCount):
-                    if (req.memoryTypeBits >> i) & 1:
-                        idx = i
-                        break
+                err = r
             if idx is None:
-                raise VkError("vkAllocateMemory", VK_ERROR_OUT_OF_DEVICE_MEMORY)
-            mai = VkMemoryAllocateInfo(sType=ST_MEMORY_ALLOCATE_INFO, allocationSize=req.size,
-                                       memoryTypeIndex=idx)
-            mem = c_void_p()
-            _check("vkAllocateMemory", vkAllocateMemory(self.device, C.byref(mai), None, C.byref(mem)))
+                raise VkError("vkAllocateMemory", err)
             _check("vkBindBufferMemory", vkBindBufferMemory(self.device, buf, mem, 0))
         except BaseException:
             vkDestroyBuffer(self.device, buf, None)

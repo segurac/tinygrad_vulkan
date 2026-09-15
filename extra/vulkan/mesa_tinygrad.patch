@@ -1,8 +1,24 @@
 diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
-index 064bce8..fddab1c 100644
---- a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
-+++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
-@@ -1364,14 +1364,16 @@ emit_bo(struct ntv_context *ctx, struct nir_variable *var, bool aliased)
+index 064bce8..fad471d 100644
++++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c	2026-09-14 22:35:36.967714208 +0200
+@@ -1351,11 +1351,13 @@
+    bool ssbo = var->data.mode == nir_var_mem_ssbo;
+    SpvId struct_type = get_bo_struct_type(ctx, var);
+    _mesa_hash_table_insert(ctx->bo_struct_types, var, (void *)(uintptr_t)struct_type);
+-   SpvId array_length = emit_uint_const(ctx, 32, glsl_get_length(var->type));
+-   SpvId array_type = spirv_builder_type_array(&ctx->builder, struct_type, array_length);
++   /* tinygrad patch: the bo struct is the variable type directly (no outer array<struct>[1]
++    * level). The deref path (emit_deref_struct/emit_deref_array) emits OpAccessChain result
++    * types assuming a ptr(struct) variable; with the extra array level those declarations are
++    * invalid SPIR-V which RADV tolerates but the NVIDIA driver rejects (crash or silent no-op) */
+    SpvId pointer_type = spirv_builder_type_pointer(&ctx->builder,
+                                                    ssbo ? SpvStorageClassStorageBuffer : SpvStorageClassUniform,
+-                                                   array_type);
++                                                   struct_type);
+    SpvId var_id = spirv_builder_emit_var(&ctx->builder, pointer_type,
+                                          ssbo ? SpvStorageClassStorageBuffer : SpvStorageClassUniform);
+    if (var->name)
+@@ -1364,14 +1366,16 @@
     if (aliased)
        spirv_builder_emit_decoration(&ctx->builder, var_id, SpvDecorationAliased);
  

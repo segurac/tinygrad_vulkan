@@ -102,7 +102,8 @@ class VulkanDevice(Compiled):
   wait_timeout_ms = 30000
   def __init__(self, device:str=""):
     self.rt = vkrt.VkRt()
-    super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram, arch="radv")
+    super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram,
+                     arch="radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
   def finalize(self):
     try: super().finalize()
     except RuntimeError as e: print(f"VULKAN synchronization failed before finalizing: {e}")
