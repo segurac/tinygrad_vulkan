@@ -287,6 +287,7 @@ vkCreatePipelineLayout = _vk("vkCreatePipelineLayout", _v + _v + _v + [C.POINTER
 vkDestroyPipelineLayout = _vk("vkDestroyPipelineLayout", _v + _v + _v, _N)
 vkCreateComputePipelines = _vk("vkCreateComputePipelines", _v + _v + [c_uint32] + 2 * _v + _v)
 vkDestroyPipeline = _vk("vkDestroyPipeline", _v + _v + _v, _N)
+vkFreeDescriptorSets = _vk("vkFreeDescriptorSets", _v + _v + [c_uint32] + _v, _N)
 vkCreateDescriptorPool = _vk("vkCreateDescriptorPool", _v + _v + _v + [C.POINTER(c_void_p)])
 vkDestroyDescriptorPool = _vk("vkDestroyDescriptorPool", _v + _v + _v, _N)
 vkAllocateDescriptorSets = _vk("vkAllocateDescriptorSets", _v + _v + [C.POINTER(c_void_p)])
@@ -584,6 +585,24 @@ class VkRt:
         p = VPipeline(self, pipe, layout, module)
         self._pipelines.append(p)
         return p
+
+    def destroy_cfg(self, pipeline:VPipeline, dsl:VDescriptorSetLayout, ubo:VBuffer|None=None):
+        """Release one program's driver objects as soon as the program is gone, not at
+        close: thousands of BEAM-search candidates would otherwise leak pipelines/modules/
+        descriptor sets and exhaust the driver's per-context resources. A pending command
+        buffer that still dispatches this pipeline is flushed first."""
+        if not getattr(self, "device", None) or not self.device: return
+        if self._cb_active and self._cb_has_dispatch: self.submit()
+        self._pipelines.remove(pipeline)
+        self._dsls.remove(dsl)
+        if pipeline.module in self._modules: self._modules.remove(pipeline.module)
+        _check("vkDestroyPipeline", vkDestroyPipeline(self.device, pipeline.handle, None))
+        if pipeline.layout: _check("vkDestroyPipelineLayout", vkDestroyPipelineLayout(self.device, pipeline.layout, None))
+        _check("vkFreeDescriptorSets", vkFreeDescriptorSets(self.device, dsl.pool, 1, _p(dsl.set)))
+        _check("vkDestroyDescriptorPool", vkDestroyDescriptorPool(self.device, dsl.pool, None))
+        _check("vkDestroyDescriptorSetLayout", vkDestroyDescriptorSetLayout(self.device, dsl.layout, None))
+        if pipeline.module: _check("vkDestroyShaderModule", vkDestroyShaderModule(self.device, pipeline.module.handle, None))
+        if ubo is not None: self.free_buffer(ubo)
 
     # -- command recording / submit --
 

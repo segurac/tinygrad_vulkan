@@ -102,15 +102,24 @@ class VulkanProgram(Program['VulkanDevice']):
     dsl = rt.create_descriptor_set_layout(bindings, dbufs)
     module = rt.create_shader_module(self.lib)
     pipeline = rt.create_compute_pipeline(module, "main", [dsl])
-    cfg = (pipeline, dsl.set, ubo_map)
+    cfg = (pipeline, dsl, ubo, ubo_map)
     self._cache[key] = cfg
     return cfg
+
+  def __del__(self):
+    # release this program's pipelines/modules/descriptors as soon as it is unreferenced
+    # (BEAM search creates and drops thousands of candidate programs per run)
+    rt = getattr(getattr(self, "dev", None), "rt", None)
+    if rt is None: return
+    for pipeline, dsl, ubo, _ in list(getattr(self, "_cache", {}).values()):
+      try: rt.destroy_cfg(pipeline, dsl, ubo)
+      except Exception: pass
 
   def __call__(self, *bufs:int|Any, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
                vals:tuple[int|float, ...]=(), wait:bool=False, timeout:int|None=None) -> float|None:
     bufs = cast(tuple[VulkanBuffer, ...], bufs)
     nvals = len(vals)
-    pipeline, desc_set, ubo_map = self._launch_cfg(bufs, nvals)
+    pipeline, dsl, ubo, ubo_map = self._launch_cfg(bufs, nvals)
     if nvals:
       var_dts = tuple(self.signature[len(bufs) + i][2] for i in range(nvals))
       ubo_map[:8 * nvals] = _pack_params(vals, var_dts)
@@ -129,7 +138,7 @@ class VulkanProgram(Program['VulkanDevice']):
       self.dev.rt.synchronize(timeout)
     st = time.perf_counter() if wait else 0
     self.dev.rt.cmd_bind_pipeline(pipeline)
-    self.dev.rt.cmd_bind_descriptor_sets(pipeline, desc_set)
+    self.dev.rt.cmd_bind_descriptor_sets(pipeline, dsl.set)
     self.dev.rt.cmd_dispatch(*global_size)
     # record-only by default: the dispatch stays in the pending command buffer and is
     # submitted at the next boundary (synchronize / _copyin / _copyout / wait=True launch).
