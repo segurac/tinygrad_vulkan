@@ -62,8 +62,8 @@ class ElementwiseMixin(CreationMixin):
     """
     if self.dtype in dtypes.weaks: return self
     uop = self._uop
-    if uop.op is Ops.CONTIGUOUS or self.device is None or uop.has_buffer_identity(): return self._wrap_uop(uop)
-    return self._wrap_uop(uop.alu(Ops.CONTIGUOUS))
+    if uop.is_self_copy or self.device is None or uop.has_buffer_identity(): return self._wrap_uop(uop)
+    return self._wrap_uop(uop.copy_to_device(uop.device))
 
   def contiguous_backward(self) -> Self:
     """
@@ -1066,7 +1066,7 @@ class ElementwiseMixin(CreationMixin):
     ```
     """
     # https://personal.math.ubc.ca/~cbm/aands/page_299.htm 7.1.26
-    t = 1.0 / (1.0 + 0.3275911 * (s:=(self >= 0).where(1.0, -1.0)) * self)
+    t = 1.0 / (1.0 + 0.3275911 * ((s:=(self >= 0).where(1.0, -1.0)) * self))
     return s * (1.0 - t * polyN(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592]) * (-self.square()).exp())
 
   def softsign(self) -> Self:
