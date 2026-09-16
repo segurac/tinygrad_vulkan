@@ -434,13 +434,22 @@ def diskcache_put(table:str, key:dict|str|int, val:Any, prepickled=False):
   if isinstance(key, (str,int)): key = {"key": key}
   conn = db_connection()
   cur = conn.cursor()
-  if table not in _db_tables:
+  def create():
     TYPES = {str: "text", bool: "integer", int: "integer", float: "numeric", bytes: "blob"}
     ltypes = ', '.join(f"{k} {TYPES[type(key[k])]}" for k in key.keys())
     cur.execute(f"CREATE TABLE IF NOT EXISTS '{table}_{VERSION}' ({ltypes}, val blob, PRIMARY KEY ({', '.join(key.keys())}))")
     _db_tables.add(table)
-  cur.execute(f"REPLACE INTO '{table}_{VERSION}' ({', '.join(key.keys())}, val) VALUES ({', '.join(['?']*len(key))}, ?)",
-              tuple(key.values()) + (val if prepickled else pickle.dumps(val),))
+  def replace():
+    cur.execute(f"REPLACE INTO '{table}_{VERSION}' ({', '.join(key.keys())}, val) VALUES ({', '.join(['?']*len(key))}, ?)",
+                tuple(key.values()) + (val if prepickled else pickle.dumps(val),))
+  if table not in _db_tables: create()
+  try: replace()
+  except sqlite3.OperationalError:
+    # the table exists with a different key schema (a key field was added/changed): recreate it
+    cur.execute(f"DROP TABLE IF EXISTS '{table}_{VERSION}'")
+    _db_tables.discard(table)
+    create()
+    replace()
   conn.commit()
   cur.close()
   return val

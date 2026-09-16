@@ -647,15 +647,18 @@ class VkRt:
         vkCmdDispatch(self.cbs[self._slot], x, y, z)
         self._cb_has_dispatch, self._in_kernel = True, False
 
-    def submit(self, wait:bool=False):
+    def submit(self, wait:bool=False, timeout_ms:int|None=None):
         """End the pending command buffer and submit it with its ring slot's fence; a
         no-op when nothing is pending. wait=False returns immediately (the work is in
-        flight); wait=True blocks until the just-submitted fence signals. On drivers
-        that need it (self._async is False, e.g. RADV on this APU) every submit waits
-        on its fence: the next in-order dispatch must not start before this submit's
-        stores are visible, so the ring never runs deeper than one."""
+        flight); wait=True blocks until the just-submitted fence signals (timeout_ms,
+        default 30 s; a timeout raises VkError so e.g. a slow BEAM candidate is skipped
+        instead of blocking forever). On drivers that need it (self._async is False,
+        e.g. RADV on this APU) every submit waits on its fence: the next in-order
+        dispatch must not start before this submit's stores are visible, so the ring
+        never runs deeper than one."""
         if not self._cb_active:
             return VK_SUCCESS
+        timeout_ns = (timeout_ms if timeout_ms is not None else 30000) * 1_000_000
         i = self._slot
         _check("vkEndCommandBuffer", vkEndCommandBuffer(self.cbs[i]))
         if not self._inflight[i]:  # fence was signaled by its previous use; reset before reuse
@@ -666,7 +669,7 @@ class VkRt:
         # a true VkFence* (pointer to a slot holding the handle) makes both of them crash
         _check("vkQueueSubmit", vkQueueSubmit(self.queue, 1, C.byref(si), self.fences[i]))
         self._inflight[i] = True
-        if wait or not self._async: self._wait_fence(i)
+        if wait or not self._async: self._wait_fence(i, timeout_ns)
         self._slot = (i + 1) % RING
         self._cb_active = False
         return VK_SUCCESS

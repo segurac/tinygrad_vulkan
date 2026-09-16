@@ -1,5 +1,5 @@
 from __future__ import annotations
-import struct, os
+import struct, os, time
 from typing import Any, cast
 from tinygrad.device import Compiled, Allocator, BufferStorage, BufferSpec, MMIOInterface, Program, TinyELF
 from tinygrad.dtype import dtypes, DType
@@ -123,6 +123,11 @@ class VulkanProgram(Program['VulkanDevice']):
         safe = _re.sub(r"\W+", "_", self.name)
         with open(f"/tmp/opencode/kernels/{self._n}_{safe}.spv", "wb") as f: f.write(self.lib)
         self._n += 1
+    if wait:
+      # timing contract (time_call/BEAM uses the return value as the kernel time): drain
+      # first so the measurement isolates this dispatch from the pending batch
+      self.dev.rt.synchronize(timeout)
+    st = time.perf_counter() if wait else 0
     self.dev.rt.cmd_bind_pipeline(pipeline)
     self.dev.rt.cmd_bind_descriptor_sets(pipeline, desc_set)
     self.dev.rt.cmd_dispatch(*global_size)
@@ -130,7 +135,10 @@ class VulkanProgram(Program['VulkanDevice']):
     # submitted at the next boundary (synchronize / _copyin / _copyout / wait=True launch).
     # vals are per-program compile-time constants, so the UBO write above stays valid while
     # earlier launches of this program are still pending.
-    if wait: self.dev.rt.submit(wait=True)
+    if wait:
+      # timeout (BEAM passes a per-candidate device timeout) is honored via the fence wait
+      self.dev.rt.submit(wait=True, timeout_ms=timeout)
+      return time.perf_counter() - st
     return None
 
 class VulkanDevice(Compiled):

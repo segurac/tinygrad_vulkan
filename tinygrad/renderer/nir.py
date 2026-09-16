@@ -414,10 +414,11 @@ class SPIRVRenderer(LVPRenderer):
              for j in range(lanes) for k in range(d)]
       loaded = nalu(b, f"vec{lanes * d}", *lds) if lanes * d > 1 else lds[0]
     elif space is AddrSpace.LOCAL:
-      # the emitter's load_shared takes a scalar offset: one 1-wide load per lane (x1 is a scalar proxy for the def width/dtype)
+      # the emitter's load_shared takes a scalar offset: one 1-wide load per (lane, component) at element off_j + k
+      # (x1 is a scalar proxy for the def width/dtype; a vec{lanes*d} built from fewer srcs leaves NULL srcs and segfaults)
       x1 = UOp.const(0, x.dtype)
-      comps = [nload(b, AddrSpace.LOCAL, self._lane_idx(b, off, j), x1) for j in range(lanes)]
-      loaded = nalu(b, f"vec{lanes * d}", *comps) if lanes * d > 1 else comps[0]
+      lds = [nload(b, AddrSpace.LOCAL, self._lane_idx_k(b, off, j, k), x1) for j in range(lanes) for k in range(d)]
+      loaded = nalu(b, f"vec{lanes * d}", *lds) if lanes * d > 1 else lds[0]
     else: loaded = nload(b, space, nidx(b, r[buf], r[off], space, buf.dtype.itemsize), x)
     return nalu(b, "bcsel", r[gate], loaded, r[alt]) if gate is not None else loaded
 
@@ -434,9 +435,12 @@ class SPIRVRenderer(LVPRenderer):
           spv_nstore(b, addr := self._bo_deref(b, self.buf_vars[buf], self._lane_idx_k(b, off, j, k)), v, buf.dtype, True)
       return addr
     if space is AddrSpace.LOCAL:
+      # mirror the GLOBAL branch: element off_j + k gets value component j*d + k
       addr = None
       for j in range(lanes):
-        nstore(b, AddrSpace.LOCAL, addr := self._lane_idx(b, off, j), r[val] if lanes * d == 1 else nchannel(b, r[val], j * d))
+        for k in range(d):
+          v = r[val] if lanes * d == 1 else nchannel(b, r[val], j * d + k)
+          nstore(b, AddrSpace.LOCAL, addr := self._lane_idx_k(b, off, j, k), v)
       return addr
     return nstore(b, space, nidx(b, r[buf], r[off], space, buf.dtype.itemsize), r[val])
 
