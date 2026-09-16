@@ -414,7 +414,9 @@ class VkRt:
         # self._slot is the ring slot the active command buffer belongs to (or the next one
         # to begin). self._inflight[i]: fence i was submitted and has not been waited on.
         # self._ncmd: commands recorded in the active command buffer.
+        # self._poisoned[i]: slot i's fence timed out once; see _wait_fence.
         self._slot, self._inflight, self._ncmd = 0, [False] * RING, 0
+        self._poisoned = [False] * RING
         self._cb_has_dispatch, self._nkernels, self._in_kernel = False, 0, False
         # the NV 550 driver does not make one dispatch's stores visible to the next
         # dispatch's loads within a single command buffer; an explicit compute->compute
@@ -607,8 +609,19 @@ class VkRt:
     # -- command recording / submit --
 
     def _wait_fence(self, i, timeout_ns=30_000_000_000):
-        _check("vkWaitForFences", vkWaitForFences(self.device, 1, C.cast((c_void_p * 1)(self.fences[i]), c_void_p),
-                                                  1, timeout_ns))
+        """Wait for ring slot i's fence. A timeout poisons the slot (the kernel is still on
+        the GPU and the fence cannot signal); later waits on it fail fast instead of paying
+        the timeout again, and a non-blocking check recovers the slot if the kernel was only
+        slow. Vulkan cannot abort a running compute kernel, so a truly stuck one blocks its
+        slot until the context dies."""
+        f = C.cast((c_void_p * 1)(self.fences[i]), c_void_p)
+        if self._poisoned[i]:
+            if vkWaitForFences(self.device, 1, f, 1, 0) == VK_SUCCESS: self._poisoned[i] = False
+            else: raise VkError("vkWaitForFences", VK_TIMEOUT)  # slot i still stuck
+        elif (res := vkWaitForFences(self.device, 1, f, 1, timeout_ns)) == VK_TIMEOUT:
+            self._poisoned[i] = True
+            raise VkError("vkWaitForFences", VK_TIMEOUT)
+        elif res != VK_SUCCESS: _check("vkWaitForFences", res)
         self._inflight[i] = False
 
     def _ensure_cb(self):
