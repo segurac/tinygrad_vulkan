@@ -1,5 +1,5 @@
 from __future__ import annotations
-import struct, os, time
+import struct, os, time, ctypes
 from typing import Any, cast
 from tinygrad.device import Compiled, Allocator, BufferStorage, BufferSpec, MMIOInterface, Program, TinyELF
 from tinygrad.dtype import dtypes, DType
@@ -31,6 +31,18 @@ def _pack_params(vals:tuple[int|float, ...], var_dts:tuple[DType, ...]) -> bytes
     elif dt in dtypes.ints: struct.pack_into(f'<{dt.fmt}', u8, off, v)
     else: raise RuntimeError(f"unsupported VULKAN param dtype {dt}")
   return bytes(u8)
+
+def _copy_to_arr(dst_arr, src_mv:memoryview, n:int):
+  # C-level memcpy from a host memoryview (read-only OK, e.g. an mmap'd weights file) into a
+  # mapped host-visible buffer. A ctypes slice assignment (dst[0:n]=src) is ~1000x slower.
+  try:
+    ctypes.memmove(dst_arr, (ctypes.c_uint8 * n).from_buffer(src_mv), n)
+  except (BufferError, TypeError):
+    ctypes.memmove(dst_arr, bytes(src_mv), n)
+
+def _copy_to_mv(dst_mv:memoryview, src_arr, n:int):
+  # C-level memcpy from a mapped host-visible buffer into a host memoryview (writable).
+  ctypes.memmove((ctypes.c_uint8 * n).from_buffer(dst_mv), src_arr, n)
 
 class VulkanAllocator(Allocator):
   # a few host-visible staging buffers, kept mapped, reused for every host<->device copy.
@@ -68,7 +80,7 @@ class VulkanAllocator(Allocator):
     # kernels; drain everything before reusing it
     self.dev.synchronize()
     st = self._staging(src.nbytes)
-    st.map()[0:src.nbytes] = src.cast('B')
+    _copy_to_arr(st.map(), src.cast('B'), src.nbytes)
     self.dev.rt.cmd_copy(dest.vbuf, st, src.nbytes, dst_off=dest.offset)
     self.dev.rt.submit()  # async H2D in its own cb; same-queue order places it before later kernels
   def _copyout(self, dest:memoryview, src:VulkanBuffer):
@@ -76,7 +88,7 @@ class VulkanAllocator(Allocator):
     # the D2H is recorded after any pending kernels in the current cb, so it runs after them
     self.dev.rt.cmd_copy(st, src.vbuf, dest.nbytes, src_off=src.offset)
     self.dev.rt.submit(wait=True)  # wait before the CPU reads staging
-    dest[:] = bytes(st.map()[0:dest.nbytes])
+    _copy_to_mv(dest, st.map(), dest.nbytes)
   def _map(self, buf): raise RuntimeError("VULKAN cross-device map not supported")
 
 class VulkanProgram(Program['VulkanDevice']):
