@@ -406,18 +406,26 @@ class SPIRVRenderer(LVPRenderer):
     # the zink emitter has no phi: a gated load does the access and selects with bcsel (no OOB guard, SPIR-V handles bounds)
     r, space = self.r, buf.addrspace
     lanes, d = off.max_numel(), x.max_numel() // off.max_numel()
+    def sidx(j, k):
+      idx = self._lane_idx_k(b, off, j, k)
+      if gate is not None:
+        # a gated load executes the access for masked-out lanes too (bcsel picks alt), and the index expression is OOB
+        # on exactly those lanes (conv padding taps). NV tolerates OOB SSBO/SS loads but RADV faults on an unmapped
+        # page (GPU reset, "context is lost"). clamp into the allocation; the bcsel zeroes the value anyway
+        idx = nalu(b, "imin", nalu(b, "imax", idx, nimm(b, 0, dtypes.int)), nimm(b, buf.max_numel() - 1, dtypes.int))
+      return idx
     if space is AddrSpace.ALU: loaded = r[buf]  # scalar param: a register read, always in range
     elif space is AddrSpace.GLOBAL:
       # the zink wrapper is a scalar array (struct{ T data[N]; }): one 1-wide load per (lane, component); component k of lane j
       # is the element at off_j + k. a single load_deref is 1-component, so a vec{d} is built from d separate scalar loads
-      lds = [spv_nload(b, self._bo_deref(b, self.buf_vars[buf], self._lane_idx_k(b, off, j, k)), buf.dtype, True)
+      lds = [spv_nload(b, self._bo_deref(b, self.buf_vars[buf], sidx(j, k)), buf.dtype, True)
              for j in range(lanes) for k in range(d)]
       loaded = nalu(b, f"vec{lanes * d}", *lds) if lanes * d > 1 else lds[0]
     elif space is AddrSpace.LOCAL:
       # the emitter's load_shared takes a scalar offset: one 1-wide load per (lane, component) at element off_j + k
-      # (x1 is a scalar proxy for the def width/dtype; a vec{lanes*d} built from fewer srcs leaves NULL srcs and segfaults)
+      # (x1 is a scalar proxy for the def width/dtype; a vec{d} built from fewer srcs leaves NULL srcs and segfaults)
       x1 = UOp.const(0, x.dtype)
-      lds = [nload(b, AddrSpace.LOCAL, self._lane_idx_k(b, off, j, k), x1) for j in range(lanes) for k in range(d)]
+      lds = [nload(b, AddrSpace.LOCAL, sidx(j, k), x1) for j in range(lanes) for k in range(d)]
       loaded = nalu(b, f"vec{lanes * d}", *lds) if lanes * d > 1 else lds[0]
     else: loaded = nload(b, space, nidx(b, r[buf], r[off], space, buf.dtype.itemsize), x)
     return nalu(b, "bcsel", r[gate], loaded, r[alt]) if gate is not None else loaded
