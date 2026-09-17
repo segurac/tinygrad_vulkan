@@ -700,10 +700,14 @@ class VkRt:
         # NOTE: these drivers (NV 550, RADV) treat the pFence arg as the fence object itself;
         # a true VkFence* (pointer to a slot holding the handle) makes both of them crash
         _check("vkQueueSubmit", vkQueueSubmit(self.queue, 1, C.byref(si), self.fences[i]))
+        # update the ring state BEFORE the (potentially raising) wait: a timed-out or
+        # failing wait must leave the ring consistent - the cb is submitted, the slot
+        # advances, and the fence is tracked as in-flight until _wait_fence clears it
+        # (_ensure_cb's backpressure waits it out before the cb is re-recorded)
         self._inflight[i] = True
-        if wait or not self._async: self._wait_fence(i, timeout_ns)
         self._slot = (i + 1) % RING
         self._cb_active = False
+        if wait or not self._async: self._wait_fence(i, timeout_ns)
         return VK_SUCCESS
 
     def synchronize(self, timeout_ms:int|None=None):

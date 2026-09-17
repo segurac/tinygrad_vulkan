@@ -133,6 +133,9 @@ class VulkanProgram(Program['VulkanDevice']):
         with open(f"/tmp/opencode/kernels/{self._n}_{safe}.spv", "wb") as f: f.write(self.lib)
         self._n += 1
     if wait:
+      # timeout 0 (beam's int(early_stop*1e3) truncates to it for microsecond-scale times)
+      # would be a 0 ns non-blocking fence wait: use the default timeout instead
+      timeout = self.dev.wait_timeout_ms if not timeout else timeout
       # timing contract (time_call/BEAM uses the return value as the kernel time): drain
       # first so the measurement isolates this dispatch from the pending batch
       self.dev.rt.synchronize(timeout)
