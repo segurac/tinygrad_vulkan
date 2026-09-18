@@ -44,6 +44,16 @@ def _copy_to_mv(dst_mv:memoryview, src_arr, n:int):
   # C-level memcpy from a mapped host-visible buffer into a host memoryview (writable).
   ctypes.memmove((ctypes.c_uint8 * n).from_buffer(dst_mv), src_arr, n)
 
+def _warmup_vendors(rt) -> bool:
+  # NV 550 drops ~44% of a cold pipeline's first-dispatch stores; dispatch it once (result
+  # discarded) so the real first launch is actually the second. VK_WARMUP: off / all /
+  # comma-sep vendor ids; default is NV only.
+  mode = os.environ.get("VK_WARMUP", "")
+  if mode == "off": return False
+  if mode == "all": return True
+  if mode: return rt.vendor in {int(v, 0) for v in mode.split(",") if v.strip()}
+  return rt.vendor == 0x10de
+
 class VulkanAllocator(Allocator):
   # a few host-visible staging buffers, kept mapped, reused for every host<->device copy.
   # safe to reuse without per-buffer tracking: kernels accumulate in the pending command
@@ -99,7 +109,7 @@ class VulkanProgram(Program['VulkanDevice']):
 
   def _launch_cfg(self, bufs:tuple[VulkanBuffer, ...], nvals:int) -> tuple:
     key = (len(bufs), nvals) + tuple((b.vbuf.handle.value, b.offset) for b in bufs)
-    if (cfg:=self._cache.get(key)) is not None: return cfg
+    if (cfg:=self._cache.get(key)) is not None: return cfg, False
     rt = self.dev.rt
     ubo = rt.buffer(8 * nvals, host_visible=True) if nvals else None
     ubo_map = ubo.map() if ubo is not None else None
@@ -116,7 +126,7 @@ class VulkanProgram(Program['VulkanDevice']):
     pipeline = rt.create_compute_pipeline(module, "main", [dsl])
     cfg = (pipeline, dsl, ubo, ubo_map)
     self._cache[key] = cfg
-    return cfg
+    return cfg, True
 
   def __del__(self):
     # release this program's pipelines/modules/descriptors as soon as it is unreferenced
@@ -131,10 +141,19 @@ class VulkanProgram(Program['VulkanDevice']):
                vals:tuple[int|float, ...]=(), wait:bool=False, timeout:int|None=None) -> float|None:
     bufs = cast(tuple[VulkanBuffer, ...], bufs)
     nvals = len(vals)
-    pipeline, dsl, ubo, ubo_map = self._launch_cfg(bufs, nvals)
+    (pipeline, dsl, ubo, ubo_map), is_new = self._launch_cfg(bufs, nvals)
     if nvals:
       var_dts = tuple(self.signature[len(bufs) + i][2] for i in range(nvals))
       ubo_map[:8 * nvals] = _pack_params(vals, var_dts)
+    if is_new and _warmup_vendors(self.dev.rt):
+      # throwaway full-grid dispatch: primes the cold pipeline so the real launch below is
+      # its second (the first loses stores on NV 550); must be the full grid -- a smaller
+      # warmup grid does not prime it. Drained before the real dispatch.
+      rt = self.dev.rt
+      rt.cmd_bind_pipeline(pipeline)
+      rt.cmd_bind_descriptor_sets(pipeline, dsl.set)
+      rt.cmd_dispatch(*global_size)
+      rt.submit(wait=True)
     # global_size is the grid (workgroup count) and local_size is the block size (baked into the
     # pipeline from the shader's workgroup_size); they are independent in Vulkan (no multiple rule).
     if os.environ.get("VKDEBUG"):
