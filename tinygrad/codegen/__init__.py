@@ -461,6 +461,8 @@ def do_render(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
     key = lin.key.hex()[:16]
     if (p := d / f"{key}.spv").is_file():
       return prg.replace(src=prg.src + (UOp(Ops.SOURCE, arg=f"<spv {key}>"), UOp(Ops.BINARY, arg=p.read_bytes())))
+    if os.environ.get("TINYGRAD_SPV_STRICT"):
+      raise RuntimeError(f"TINYGRAD_SPV_DIR={d} missing {key}.spv (re-dump with VKDUMP=1 on a machine with the compiler)")
     ctx._spv_key = key
   src = ctx.render(list(lin.src))
   return prg.replace(src=prg.src + (UOp(Ops.SOURCE, arg=src),))
