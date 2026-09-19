@@ -1,7 +1,47 @@
 diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
-index 064bce8..fad471d 100644
-+++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c	2026-09-14 22:35:36.967714208 +0200
-@@ -1351,11 +1351,13 @@
+@@ -1290,21 +1290,33 @@
+    if (he)
+       return (SpvId)(uintptr_t)he->data;
+    unsigned bitsize = glsl_get_bit_size(glsl_get_array_element(glsl_get_struct_field(glsl_without_array(var->type), 0)));
+    assert(bitsize);
+    SpvId array_type;
+    const struct glsl_type *type = glsl_without_array(var->type);
+    const struct glsl_type *first_type = glsl_get_struct_field(type, 0);
+    if (!glsl_type_is_unsized_array(first_type)) {
+       uint32_t array_size = glsl_get_length(first_type);
+       assert(array_size);
+-      return get_sized_uint_array_type(ctx, array_size, bitsize);
++      /* tinygrad patch: declare the array with the bo's actual element type (e.g. float) instead of
++       * uint. The uint representation is only self-consistent inside zink, where the NIR deref chain
++       * stays uint-typed; tinygrad's derefs carry the real element type, and an OpAccessChain with a
++       * typed (e.g. ptr<float>) result over a uint array is invalid SPIR-V: lenient drivers tolerate
++       * it, but Qualcomm's Adreno frontend aborts (vkCreateComputePipelines -> VK_ERROR_UNKNOWN). */
++      if (bitsize == 16)
++         spirv_builder_emit_cap(&ctx->builder, SpvCapabilityStorageBuffer16BitAccess);
++      SpvId array_length = emit_uint_const(ctx, 32, array_size);
++      array_type = spirv_builder_type_array(&ctx->builder,
++                                            get_glsl_type(ctx, glsl_get_array_element(first_type), false),
++                                            array_length);
++      spirv_builder_emit_array_stride(&ctx->builder, array_type, bitsize / 8);
++      return array_type;
+    }
+    SpvId uint_type = spirv_builder_type_uint(&ctx->builder, bitsize);
+    array_type = spirv_builder_type_runtime_array(&ctx->builder, uint_type);
+    spirv_builder_emit_array_stride(&ctx->builder, array_type, bitsize / 8);
+    return array_type;
+ }
+ 
+ /* get array<struct(array_type) <--this one> */
+ static SpvId
+ get_bo_struct_type(struct ntv_context *ctx, struct nir_variable *var)
+@@ -1344,41 +1356,45 @@
+    return struct_type;
+ }
+ 
+ static void
+ emit_bo(struct ntv_context *ctx, struct nir_variable *var, bool aliased)
+ {
+    unsigned bitsize = glsl_get_bit_size(glsl_get_array_element(glsl_get_struct_field(glsl_without_array(var->type), 0)));
     bool ssbo = var->data.mode == nir_var_mem_ssbo;
     SpvId struct_type = get_bo_struct_type(ctx, var);
     _mesa_hash_table_insert(ctx->bo_struct_types, var, (void *)(uintptr_t)struct_type);
@@ -18,7 +58,8 @@ index 064bce8..fad471d 100644
     SpvId var_id = spirv_builder_emit_var(&ctx->builder, pointer_type,
                                           ssbo ? SpvStorageClassStorageBuffer : SpvStorageClassUniform);
     if (var->name)
-@@ -1364,14 +1366,16 @@
+       spirv_builder_emit_name(&ctx->builder, var_id, var->name);
+ 
     if (aliased)
        spirv_builder_emit_decoration(&ctx->builder, var_id, SpvDecorationAliased);
  
@@ -43,3 +84,46 @@ index 064bce8..fad471d 100644
        assert(!ctx->ubos[var->data.driver_location][idx]);
        ctx->ubos[var->data.driver_location][idx] = var_id;
        ctx->ubo_vars[var->data.driver_location] = var;
+    }
+    if (ctx->spirv_1_4_interfaces) {
+       assert(ctx->num_entry_ifaces < ARRAY_SIZE(ctx->entry_ifaces));
+       ctx->entry_ifaces[ctx->num_entry_ifaces++] = var_id;
+    }
+    _mesa_hash_table_insert(ctx->vars, var, (void *)(intptr_t)var_id);
+ 
+@@ -1767,20 +1783,35 @@
+       }
+    }
+ 
+    unsigned bit_size = alu->def.bit_size;
+    unsigned num_components = alu->def.num_components;
+    nir_alu_type atype = bit_size == 1 ?
+                         nir_type_bool :
+                         (alu_op_is_typeless(alu->op) ? typeless_type : nir_op_infos[alu->op].output_type);
+    SpvId dest_type = get_def_type(ctx, &alu->def, atype);
+ 
++   /* tinygrad patch: an integer conversion that keeps the same width is either a no-op (same
++    * signedness) or a reinterpretation (sign flip). SPIR-V forbids SConvert/UConvert with equal
++    * bit widths (VUID-StandaloneSpirv-None-04712): lenient drivers tolerate it, strict drivers
++    * (Qualcomm Adreno) reject the module. Emit neither. */
++   if ((alu->op == nir_op_i2i8 || alu->op == nir_op_i2i16 || alu->op == nir_op_i2i32 ||
++        alu->op == nir_op_u2u8 || alu->op == nir_op_u2u16 || alu->op == nir_op_u2u32 ||
++        alu->op == nir_op_i2i64 || alu->op == nir_op_u2u64) &&
++       nir_src_bit_size(alu->src[0].src) == alu->def.bit_size) {
++      if (nir_alu_type_get_base_type(stype[0]) == nir_alu_type_get_base_type(atype))
++         store_def(ctx, alu->def.index, src[0], atype);
++      else
++         store_def(ctx, alu->def.index, emit_bitcast(ctx, dest_type, src[0]), atype);
++      return;
++   }
++
+    SpvId result = 0;
+    switch (alu->op) {
+    case nir_op_mov:
+       assert(nir_op_infos[alu->op].num_inputs == 1);
+       result = src[0];
+       break;
+ 
+ #define UNOP(nir_op, spirv_op) \
+    case nir_op: \
+       assert(nir_op_infos[alu->op].num_inputs == 1); \

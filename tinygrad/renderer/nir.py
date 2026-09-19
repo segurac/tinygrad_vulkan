@@ -101,7 +101,11 @@ spv_nstore = nir_instr(has_def=False, df=lambda addr: addr, num_components=1,
 ngid = nir_instr(nc=3, bs=32)(lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_workgroup_id))
 nlid = nir_instr(nc=3, bs=32)(lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_local_invocation_id))
 
-nbarrier = nir_instr(has_def=False, intrins={"EXECUTION_SCOPE":mesa.SCOPE_WORKGROUP})(
+# a fully-scoped barrier: a bare execution scope leaves the memory scope NONE, which the
+# spirv exporter lowers to OpControlBarrier <workgroup> <invocation> 0 -- invalid in Vulkan
+# (and ambiguous elsewhere); the memory modes keep the emitted semantics to workgroup storage
+nbarrier = nir_instr(has_def=False, intrins={"EXECUTION_SCOPE":mesa.SCOPE_WORKGROUP, "MEMORY_SCOPE":mesa.SCOPE_WORKGROUP,
+                                             "MEMORY_MODES":mesa.nir_var_mem_shared})(
   lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_barrier))
 
 @nir_instr(has_def=False, target=lambda tgt:tgt and ctypes.pointer(tgt), condition=lambda cond:cond and nsrc(cond),
