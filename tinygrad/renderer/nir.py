@@ -182,8 +182,11 @@ class NIRRenderer(Renderer):
     super().__init__(target)
     self.compiler = fromimport("tinygrad.runtime.support.compiler_mesa", self.__class__.__name__.replace("Renderer", "Compiler"))(target.arch)
     if hasattr(self.compiler, "nir_options"): self.nir_options = self.compiler.nir_options
-    mesa.glsl_type_singleton_init_or_ref()
-    self._deinit_types = True
+    try:
+      mesa.glsl_type_singleton_init_or_ref()
+      self._deinit_types = True
+    except AttributeError:
+      self._deinit_types = False  # no mesa lib: TINYGRAD_SPV_DIR pre-compiled path, rendering never happens
 
   def __del__(self):
     if getattr(self, "_deinit_types", False): mesa.glsl_type_singleton_decref()

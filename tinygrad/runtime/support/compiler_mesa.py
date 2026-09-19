@@ -165,21 +165,12 @@ class SPIRVCompiler(Compiler):
 
   def compile(self, src) -> bytes:
     # src is the base64 encoded serialized NIR blob from the renderer (or the raw blob bytes)
-    spv_path = None
-    if (d := os.environ.get("TINYGRAD_SPV_DIR")) is not None:
-      # pre-compiled shader directory keyed by sha256(src): the compiling machine (VKDUMP=1)
-      # populates it, the target loads from it without running the mesa compiler
-      raw = src.encode() if isinstance(src, str) else bytes(src)
-      spv_path = pathlib.Path(d) / (hashlib.sha256(raw).hexdigest()[:16] + ".spv")
-      if spv_path.is_file(): return spv_path.read_bytes()
+    assert self.lib is not None, "TINYGRAD_SPV_DIR is set but this kernel has no pre-compiled shader (re-dump with VKDUMP=1)"
     blob = base64.b64decode(src) if isinstance(src, str) else bytes(src)
     out_words, out_num = ctypes.POINTER(ctypes.c_uint32)(), ctypes.c_size_t(0)
     assert self.lib.tinyzink_nirblob_to_spirv(blob, len(blob), ctypes.byref(out_words), ctypes.byref(out_num)) == 0, "nir_to_spirv failed"
     ret = bytes((ctypes.c_uint32 * out_num.value).from_address(ctypes.addressof(out_words.contents)))
     self.lib.tinyzink_free_words(out_words)
-    if spv_path is not None and os.environ.get("VKDUMP"):
-      spv_path.parent.mkdir(parents=True, exist_ok=True)
-      spv_path.write_bytes(ret)
     return ret
 
   def disassemble(self, lib: bytes):

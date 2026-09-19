@@ -1,5 +1,5 @@
 from dataclasses import replace, dataclass
-import itertools, functools
+import itertools, functools, os, pathlib
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, USE_TC
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, TracingKey, Context, panic
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
@@ -449,13 +449,28 @@ def do_assemble(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
   binary = ctx.asm(prg, lin)
   return prg.replace(src=prg.src[:2]+(UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
 
+def _spv_dir() -> pathlib.Path|None:
+  return pathlib.Path(os.environ["TINYGRAD_SPV_DIR"]) if os.environ.get("TINYGRAD_SPV_DIR") else None
+
 def do_render(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
+  # TINYGRAD_SPV_DIR: pre-compiled binaries keyed by the linearized uops (structurally
+  # deterministic, same on every machine) -- devices without a compiler (e.g. Android/Termux,
+  # no tinymesa) load them here and never render; the compiling side (VKDUMP=1) dumps under the
+  # same key in do_compile
+  if (d := _spv_dir()) is not None:
+    key = lin.key.hex()[:16]
+    if (p := d / f"{key}.spv").is_file():
+      return prg.replace(src=prg.src + (UOp(Ops.SOURCE, arg=f"<spv {key}>"), UOp(Ops.BINARY, arg=p.read_bytes())))
+    ctx._spv_key = key
   src = ctx.render(list(lin.src))
   return prg.replace(src=prg.src + (UOp(Ops.SOURCE, arg=src),))
 
 def do_compile(ctx:Renderer, prg:UOp, source:UOp) -> UOp|None:
   if DEBUG >= 4: print(source.arg)
   lib = ctx.compiler.compile_cached(source.arg)
+  if (d := _spv_dir()) is not None and getattr(ctx, "_spv_key", None) and os.environ.get("VKDUMP"):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{ctx._spv_key}.spv").write_bytes(lib)
   if DEBUG >= 7: ctx.compiler.disassemble(lib)
   return prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=lib),))
 
