@@ -428,7 +428,10 @@ class VkRt:
         # only becomes visible across the next submit's fence). There we give every kernel
         # and every copy its own command buffer (flush on bind_pipeline / cmd_copy) and let
         # the _async=False per-submit fence wait serialize them: the pre-batching behavior.
-        self._per_kernel_submit = self.vendor == 0x1002
+        # Adreno (5143) has the same class of bug but worse: a cb mixing copies/dispatches
+        # loses stores (wrong results) and eventually hangs (driver returns VK_TIMEOUT from
+        # vkQueueSubmit). There, per-cb kernels with async submits.
+        self._per_kernel_submit = self.vendor in (0x1002, 0x5143)
 
         self.fences = (c_void_p * RING)()
         for i in range(RING):
