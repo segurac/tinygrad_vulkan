@@ -1,6 +1,6 @@
 from typing import Callable, Any
 from tinygrad.dtype import AddrSpace, DType, dtypes, truncate
-from tinygrad.helpers import DEBUG, OSX, unwrap, fromimport, Target, is_image_shape, round_up
+from tinygrad.helpers import DEBUG, OSX, getenv, unwrap, fromimport, Target, is_image_shape, round_up
 from tinygrad.renderer import Renderer, with_storage
 from tinygrad.renderer.cstyle import CUDARenderer
 from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str
@@ -357,7 +357,19 @@ class SPIRVRenderer(LVPRenderer):
      lambda ctx,x,buf,off: ctx.sload(ctx.b, x, buf, off, None, None)),
   ]) + LVPRenderer.def_rewrite
 
-  def __init__(self, target:Target = Target(arch="x86_64")): super().__init__(target)
+  def __init__(self, target:Target = Target(arch="x86_64")):
+    super().__init__(target)
+    # per-ICD dispatch limit (workgroups per dim). The Adreno ICD silently clamps any global
+    # dim over its limit (measured on the 710: a 1D grid truncates at 524288 workgroups; a
+    # 3D conv grid (3,4,N) is correct for N<=2048 but wrong for N>=4096 -- the classic Adreno
+    # small-z quirk). get_grouped_dims(reverse=True) can land the large batch dim in any final
+    # grid slot, so cap every dim at the measured 2048 (gpudims._split_dims reshapes to fit).
+    # The props struct is non-standard on this ICD (device name is ASCII-shifted), so use the
+    # empirically-measured limit, not a parsed value. VK_GRID_MAX="x,y,z" overrides.
+    if (gm := getenv("VK_GRID_MAX", "")):
+      x, y, z = (int(v) for v in gm.split(","))
+      self.global_max = (x, y, z)
+    elif target.arch == "vk5143": self.global_max = (2048, 2048, 2048)
 
   # The zink exporter omits the SPIR-V 16BitStorage capability and NV (550) silently miscompiles
   # 16-bit float ops (Llama-3.2-1B in bf16 produced garbage); RADV executes native f16/bf16

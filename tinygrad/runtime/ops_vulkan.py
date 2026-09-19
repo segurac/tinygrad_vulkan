@@ -3,7 +3,7 @@ import struct, os, time, ctypes
 from typing import Any, cast
 from tinygrad.device import Compiled, Allocator, BufferStorage, BufferSpec, MMIOInterface, Program, TinyELF
 from tinygrad.dtype import dtypes, DType
-from tinygrad.helpers import mv_address
+from tinygrad.helpers import getenv, mv_address
 from tinygrad.renderer.nir import SPIRVRenderer
 from tinygrad.runtime.support import vulkan_rt as vkrt
 
@@ -188,8 +188,10 @@ class VulkanDevice(Compiled):
   wait_timeout_ms = 30000
   def __init__(self, device:str=""):
     self.rt = vkrt.VkRt()
-    super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram,
-                     arch="radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
+    # VK_ARCH overrides the target arch (e.g. dump Adreno-keyed spv from a desktop box); the
+    # arch selects the renderer/limits, independent of the physical device running the spv.
+    arch = getenv("VK_ARCH", "") or ("radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
+    super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram, arch=arch)
   def synchronize(self, timeout:int|None=None):
     # no timeline on this backend (work is not signaled into dev.timeline): flush the
     # pending command buffer, then wait on the submit ring's fences

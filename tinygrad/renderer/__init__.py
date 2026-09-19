@@ -77,6 +77,7 @@ class Renderer:
   code_for_op: dict[Ops, Callable] = {}
 
   compiler: Compiler = Compiler()
+  _spv_key: str|None = None # TINYGRAD_SPV_DIR: set in do_render, read in do_compile (see codegen/__init__.py)
 
   def __init__(self, target:Target): self.target = target
   def __reduce__(self): return self.__class__, (self.target,)
