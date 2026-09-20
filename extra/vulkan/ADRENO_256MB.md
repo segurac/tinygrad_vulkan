@@ -37,13 +37,15 @@ Why "uniformly wrong" and not a partial write: offsets in `[2²⁸, size)` wrap 
   largest buffer in the MNIST model, so it trips the limit first as batch grows.
 
 ## Workaround (mitigate on the client; do not "fix" in codegen)
-Keep every buffer ≤ 256 MiB: `N × C × H × W × 4 ≤ 268435456`. For the conv1 output
-(`C=32, H=W=24`): **N ≤ 3640** per chunk.
+Keep every buffer ≤ 256 MiB: `N × C × H × W × 4 ≤ 268435456`. The chunk size is bounded by
+the **largest** tensor the model materializes, not just the conv output.
 
-`examples/beautiful_mnist.py`:
-- **Training** (batch 512): conv1 output = 36 MiB — fine as-is.
-- **Eval** (`get_test_acc`, full 10k): conv1 output = 703 MiB — **must chunk** into ≤ 3640
-  rows (we use 2048). Per-chunk accuracy is exact (10k chunked eval = 8.21% = CPU).
+`examples/beautiful_mnist.py` (largest 10k-eval buffer, measured):
+- **Training** (batch 512): largest buffer ≈ 61 MiB — fine as-is.
+- **Eval** (`get_test_acc`, full 10k): the largest intermediate is **1191 MiB** (a conv
+  implicit-GEMM buffer — bigger than conv1's 703 MiB output) — **must chunk**. Safe chunk:
+  `268435456 / (1249280000/10000) ≈ 2148` rows; we use **2048**. Per-chunk accuracy is exact
+  (10k chunked eval = 8.21% = CPU).
 
 It is a driver bug (valid SPIR-V, correct on NVIDIA); the real fix is upstream in the
 driver. tinygrad now **fails fast**: `VulkanAllocator.alloc` (ops_vulkan.py) refuses any
