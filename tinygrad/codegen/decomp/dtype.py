@@ -217,9 +217,9 @@ pm_float_decomp: PatternMatcher = PatternMatcher([
   # still emulated-dtype, so decomp+round them here before the bottom-up pass rewrites them raw
   (UPat((Ops.CMPEQ, Ops.CMPNE, Ops.CMPLT), src=[UPat.var("a"), UPat.var("b")], name="x"), lambda ctx,a,b,x:
      x.replace(src=(f2f_grid(a, ctx), f2f_grid(b, ctx))) if (a.dtype == ctx[0] or b.dtype == ctx[0]) else None),
-  # NOT AFTER: its src[0] is storage, casting it to the emulated dtype is a type lie; its dtype follows
-  # the buffer rewrite and the load/store arms own the conversion
-  (UPat(GroupOp.All-GroupOp.Defines-{Ops.CAST, Ops.BITCAST, Ops.CONST, Ops.AFTER}, dtypes.floats, name="x"), lambda ctx,x:
+  # narrow the src-cast to ALU/STACK/INDEX (upstream "fix pm_float_decomp for AFTER"): casting a
+  # storage-backed op's src (e.g. AFTER) to the emulated dtype is a type lie; the load/store arms own it
+  (UPat(GroupOp.ALU|{Ops.STACK, Ops.INDEX}, dtypes.floats, name="x"), lambda ctx,x:
     UOp(x.op, src=tuple(s.cast(ctx[1]) if s.dtype == ctx[0] else s for s in x.src), arg=x.arg, tag=x.tag) if x.dtype == ctx[0] else None),
   (UPat(Ops.STORE, src=(UPat.var("idx"), UPat(Ops.BITCAST, dtypes.floats, name="val")), name='st'), lambda ctx,st,idx,val:
    st.replace(src=(idx, val.src[0].bitcast(f2f_dt[ctx[0]]))) if val.dtype == ctx[0] and idx.tag == ctx[0] else None),
