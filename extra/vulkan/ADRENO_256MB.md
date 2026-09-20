@@ -46,7 +46,10 @@ Keep every buffer ≤ 256 MiB: `N × C × H × W × 4 ≤ 268435456`. For the co
   rows (we use 2048). Per-chunk accuracy is exact (10k chunked eval = 8.21% = CPU).
 
 It is a driver bug (valid SPIR-V, correct on NVIDIA); the real fix is upstream in the
-driver, chunking is the correct client-side mitigation.
+driver. tinygrad now **fails fast**: `VulkanAllocator.alloc` (ops_vulkan.py) refuses any
+buffer larger than the per-arch limit `_VULKAN_MAX_BUFFER` (Adreno vk5143 → 2²⁸) with an
+actionable error, instead of silently returning wrong values. Chunking (above) is the
+correct workaround; `VK_MAX_BUFFER` overrides the limit (0 = unlimited).
 
 ## Repro
 Dump the exact kernel on NVIDIA and print the correct reference, then run the identical

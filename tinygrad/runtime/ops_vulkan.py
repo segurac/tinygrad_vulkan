@@ -7,6 +7,12 @@ from tinygrad.helpers import getenv, mv_address
 from tinygrad.renderer.nir import SPIRVRenderer
 from tinygrad.runtime.support import vulkan_rt as vkrt
 
+# per-arch single storage-buffer size limit, bytes (absent/None = unlimited). The Adreno
+# vk5143 Vulkan driver mis-addresses buffers > 2^28 bytes and returns silently-wrong values
+# instead of erroring (see extra/vulkan/ADRENO_256MB.md). Extend this table as more affected
+# GPUs are found; VK_MAX_BUFFER overrides it (0 = unlimited).
+_VULKAN_MAX_BUFFER = {"vk5143": 2**28}
+
 class VulkanBuffer:
   # a view into a VkBuffer (device-local data, host-visible params/staging);
   # the descriptor addresses (handle, offset)
@@ -64,6 +70,14 @@ class VulkanAllocator(Allocator):
   def __init__(self, dev:Compiled):
     super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
     self._staging_bufs:list = []
+  def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
+    # check before the base alloc, whose error wrapper would re-raise this as a bare MemoryError
+    if (maxb := getattr(self.dev, "max_buffer", None)) and size > maxb:
+      raise RuntimeError(f"VULKAN: {size/2**20:.0f} MiB buffer exceeds this device's {maxb/2**20:.0f} MiB per-buffer limit. "
+                         f"This Adreno driver mis-addresses larger buffers and would return silently-wrong values, so the "
+                         f"allocation is refused. Run in smaller sub-batches so no single tensor exceeds {maxb} bytes "
+                         f"(see extra/vulkan/ADRENO_256MB.md).")
+    return super().alloc(size, options)
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.external_ptr is not None: raise RuntimeError("VULKAN does not support external_ptr")
     if options.host:
@@ -191,6 +205,7 @@ class VulkanDevice(Compiled):
     # VK_ARCH overrides the target arch (e.g. dump Adreno-keyed spv from a desktop box); the
     # arch selects the renderer/limits, independent of the physical device running the spv.
     arch = getenv("VK_ARCH", "") or ("radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
+    self.max_buffer = getenv("VK_MAX_BUFFER", _VULKAN_MAX_BUFFER.get(arch) or 0) or None
     super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram, arch=arch)
   def synchronize(self, timeout:int|None=None):
     # no timeline on this backend (work is not signaled into dev.timeline): flush the
