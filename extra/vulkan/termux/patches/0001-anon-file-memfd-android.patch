@@ -1,0 +1,19 @@
+Subject: util/anon_file: force raw memfd_create syscall on Android (Termux)
+
+Termux's libc (bionic) may not expose the memfd_create prototype even though
+meson's pkg-config check sets HAVE_MEMFD_CREATE. On Android force the
+raw-syscall path (SYS_memfd_create) so util/anon_file works.
+
+Applied by build_termux.sh (python string patch); this file is the reference.
+
+--- a/src/util/anon_file.c
++++ b/src/util/anon_file.c
+@@
+ #include "anon_file.h"
+ #include "detect_os.h"
+
++#if defined(__ANDROID__) && defined(HAVE_MEMFD_CREATE)
++#undef HAVE_MEMFD_CREATE
++#endif
++
+ #ifndef _WIN32

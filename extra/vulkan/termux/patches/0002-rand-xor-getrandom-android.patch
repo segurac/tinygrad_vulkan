@@ -1,0 +1,18 @@
+Subject: util/rand_xor: use /dev/urandom fallback on Android (Termux)
+
+Termux's libc (bionic) lacks the getrandom() prototype even though meson's
+pkg-config check sets HAVE_GETRANDOM. On Android force the /dev/urandom
+fallback (src/util/rand_xor.c already implements it for !HAVE_GETRANDOM).
+
+Applied by build_termux.sh (python string patch); this file is the reference.
+
+--- a/src/util/rand_xor.c
++++ b/src/util/rand_xor.c
+@@
+ #include "detect_os.h"
+
++#if defined(__ANDROID__) && defined(HAVE_GETRANDOM)
++#undef HAVE_GETRANDOM
++#endif
++
+ #if !DETECT_OS_WINDOWS
