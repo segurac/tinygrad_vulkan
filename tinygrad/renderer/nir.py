@@ -124,6 +124,19 @@ def nidx(b:mesa.nir_builder, buf, off, space, itemsize, gate=None) -> mesa.nir_d
        lambda: nalu(b, "iadd", buf, nalu(b, "imul", off, nimm(b, itemsize, dtypes.long))))
   return if_phi(b, gate, f, lambda: buf) if gate is not None else f()
 
+# some drivers (RADV) miscompute sub-word integer comparisons packed in 32-bit lanes: (u8 & mask) == 0
+# is wrong for mask > 1 while the identical u32 kernel is correct, and the emitted SPIR-V is valid;
+# compare at 32 bits, which every target here handles natively. weakint consts are still bare at this
+# stage (pm_cast_const commits them later), so commit them at the strong side's width first, mirroring
+# commit_weak_consts, before widening (a negative const must wrap at the operand width, not at 32)
+def _widen_subword_cmp(x2:UOp, x:UOp, y:UOp) -> UOp|None:
+  strong = [d for d in (x.dtype, y.dtype) if d in dtypes.ints]
+  if not any(d.bitsize < 32 for d in strong): return None
+  common = max(strong, key=lambda d: (d.bitsize, d in dtypes.sints))
+  wide = dtypes.int32 if common in dtypes.sints else dtypes.uint32
+  return x2.replace(src=((x.cast(common) if x.dtype is dtypes.weakint else x).cast(wide),
+                         (y.cast(common) if y.dtype is dtypes.weakint else y).cast(wide)))
+
 class NIRRenderer(Renderer):
   suffix = "NIR"
   nir_options: bytes
@@ -141,6 +154,10 @@ class NIRRenderer(Renderer):
      lambda x,idx: x.replace(src=(with_storage(idx, dtypes.uint8), x.src[1].cast(dtypes.uint8))+x.src[2:])),
     # NIR requires shift amount to be 32 bit: https://docs.mesa3d.org/nir/alu.html#nir-alu-op-ishl
     (UPat((Ops.SHL, Ops.SHR), name="x"), lambda x: x.replace(src=(x.src[0], x.src[1].cast(dtypes.uint))) if x.src[1].dtype.bitsize != 32 else None),
+    # sub-word integer comparisons miscompiled on some drivers; see _widen_subword_cmp
+    (UPat((Ops.CMPEQ, Ops.CMPNE, Ops.CMPLT), dtype=dtypes.bool, src=(UPat.var("x", dtypes.ints+(dtypes.weakint,)),
+                                                                     UPat.var("y", dtypes.ints+(dtypes.weakint,))), name="x2"),
+     _widen_subword_cmp),
     # OpConvertFToU is undefined if Result Type is not wide enough, cast through int32
     # ref: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpConvertFToU
     (UPat(Ops.CAST, (dtypes.uchar, dtypes.ushort), src=(UPat.var("x", dtypes.floats),), name="c"), lambda x,c: x.cast(dtypes.int32).cast(c.dtype)),
