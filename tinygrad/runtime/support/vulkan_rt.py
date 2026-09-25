@@ -383,6 +383,8 @@ class VkRt:
         # from the previous dispatch's temp buffer. It is bit-exact only when every submit's
         # fence is waited on before the next submit (see submit). NV550 and llvmpipe are
         # correct at full async. VK_ASYNC=0/1 overrides the per-vendor default.
+        # Retested on mesa 26.1.6 (RADV gfx10.3): still broken -- VK_ASYNC=1 gives plausible
+        # training loss but 2.5% eval accuracy (stale weight reads); keep it off.
         self._async = os.environ.get("VK_ASYNC", "0" if self.vendor == 0x1002 else "1") == "1"
 
         mp = VkPhysicalDeviceMemoryProperties()
@@ -430,8 +432,11 @@ class VkRt:
         # the _async=False per-submit fence wait serialize them: the pre-batching behavior.
         # Adreno (5143) has the same class of bug but worse: a cb mixing copies/dispatches
         # loses stores (wrong results) and eventually hangs (driver returns VK_TIMEOUT from
-        # vkQueueSubmit). There, per-cb kernels with async submits.
-        self._per_kernel_submit = self.vendor in (0x1002, 0x5143)
+        # vkQueueSubmit). There, per-cb kernels with async submits. VK_PER_KERNEL=0/1
+        # overrides the per-vendor default (A/B against a driver fix).
+        # Retested on mesa 26.1.6 (RADV gfx10.3, sync submits): still broken -- batched cbs
+        # (VK_PER_KERNEL=0) give nan loss from step 1, the in-cb visibility bug survives.
+        self._per_kernel_submit = os.environ.get("VK_PER_KERNEL", "1" if self.vendor in (0x1002, 0x5143) else "0") == "1"
 
         self.fences = (c_void_p * RING)()
         for i in range(RING):
