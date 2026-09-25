@@ -69,6 +69,21 @@ LIBC_PATH=/system/lib64/libc.so DEV=CPU PYTHONPATH=$PWD python examples/beautifu
   that a full-batch test eval exceeds. The smalltensors variant chunks the eval;
   reported accuracy is identical (`EVAL_BS` tunes the chunk size).
 
+## Known driver bugs
+
+Driver-side bugs hit while developing this branch, and how the code deals with them
+(full write-ups in `extra/vulkan/`):
+
+| Bug | Where | Status |
+|-----|-------|--------|
+| 256 MiB per-buffer limit (byte offsets ≥ 2²⁸ wrap) | Adreno `vk5143` | Mitigated in code: fail-fast cap + eval chunking — `extra/vulkan/ADRENO_256MB.md` |
+| D2H slice from a > 2³¹-byte buffer reads zeros | RADV, Mesa ≤ 25.0.7 | **Fixed upstream** in Mesa 26.1.6 (verified: OLMoE runs on the APU); no code change |
+| Sub-word integer compare miscompute, e.g. `(u8 & m) == 0` | RADV (Mesa 25.0.7) | Worked around in the renderer — compares at 32 bits, `c403a7b3f`; also fixed in Mesa 26.1.6, kept for other drivers |
+| 128-byte const-table kernel miscompiled (few bytes → 0; breaks iq2/iq3 GGUF) | RADV, Mesa 26.1.6 | **Open, left unfixed** (upstream-synced core shouldn't diverge for a driver bug) — `extra/vulkan/RADV_CONST128.md` + `radv_const128_broken.spv` |
+
+Mesa version matters on AMD: the two fixed bugs above are version-specific (25.0.7 vs
+26.1.6). Check `vulkaninfo` driverInfo when triaging a wrong-value issue on RADV.
+
 ## Env var reference
 
 | Var                  | Meaning                                                                 |
