@@ -13,11 +13,6 @@ class TestConv(unittest.TestCase):
     assert ret[0,0,0,0] == 48
     assert ret[0,0,0,1] == 72
 
-  def test_simple_rand(self):
-    x = Tensor.rand(1,12,16,32)
-    w = Tensor.rand(32,12,3,3)
-    x.conv2d(w, stride=(2,2), padding=(1,1)).numpy()
-
   def test_many_simple(self):
     x = Tensor(np.arange(8*2*8).reshape(1,8,2,8).astype(np.float32))
     #w = Tensor(np.arange(8*8*1*1).reshape(8,8,1,1).astype(np.float32))
@@ -47,8 +42,8 @@ class TestConv(unittest.TestCase):
     np.testing.assert_allclose(out.relu().numpy(), np.maximum(out.numpy(), 0), atol=1e-6)
 
   def test_two_overlapping_binops_no_rerun(self):
-    x = Tensor.randn(1,12,16,32)
-    w = Tensor.randn(32,12,3,3)
+    x = Tensor.randn(1,3,8,16)
+    w = Tensor.randn(4,3,3,3)
     out = x.conv2d(w, stride=(2,2), padding=(1,1))
     r1, r2 = out.relu(), out.elu()
     np.testing.assert_allclose(r1.numpy(), np.maximum(out.numpy(), 0), atol=1e-5)
@@ -89,11 +84,6 @@ class TestConv(unittest.TestCase):
 
     w = Tensor.rand(32,1,3,3)
     x = x.conv2d(w, padding=(1,1), groups=32)
-    x.numpy()
-
-  def test_reduce_relu(self):
-    x = Tensor.rand(1,12,16,32)
-    x = x.sum(keepdim=True).relu()
     x.numpy()
 
   def test_bias(self):

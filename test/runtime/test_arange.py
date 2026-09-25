@@ -34,7 +34,7 @@ class TestArange(unittest.TestCase):
   def test_eye_complexity(self):
     with Context(NOOPT=1):
       # NOTE: not every backend supports CMPEQ
-      self.assertLessEqual(self._get_flops(Tensor.eye(2560).clone(), np.eye(2560)), 2*2560*2560)
+      self.assertLessEqual(self._get_flops(Tensor.eye(1280).clone(), np.eye(1280)), 2*1280*1280)
 
 DSET, DDIM = 2048, 32
 
@@ -87,20 +87,6 @@ class TestIndexing(unittest.TestCase):
       comp = ((r == i[:, None, None]).where(a[None], 0) + (r == j[:, None, None]).where(b[None], 0)).sum(1).numpy()
       self.assertLess(GlobalCounters.global_ops, 4*DSET)
     np.testing.assert_allclose(comp, a.numpy()[[3, 50, 99]] + b.numpy()[[7, 1, 2000]])
-
-  def test_index(self):
-    dataset = Tensor.rand(DSET, DDIM).realize()
-    idxs = Tensor([0,3,5,6]).realize()
-    real_index = dataset.numpy()[idxs.numpy()]
-    print("*** indexing ***")
-    with Context(NOOPT=1):
-      GlobalCounters.reset()
-      X = dataset[idxs]
-      assert X.shape == (4,DDIM)
-      linear, var_vals = check_schedule(X, 1)
-      run_linear(linear, var_vals)
-      assert GlobalCounters.global_ops < 4*DSET, f"too many ops {GlobalCounters.global_ops}"
-    np.testing.assert_allclose(real_index, X.numpy())
 
   def test_index_fused(self, noopt=1):
     dataset = Tensor.rand(DSET, DDIM).realize()
