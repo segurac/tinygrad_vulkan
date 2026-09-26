@@ -194,9 +194,17 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
+def _gguf_nbytes(n: int, ggml_type: int) -> int:
+  if (dtype := _GGML_NATIVE.get(ggml_type)) is not None: return dtype.itemsize * n
+  if (nbytes_per_block := _GGML_QUANT.get(ggml_type)) is not None: return (n // nbytes_per_block[0]) * nbytes_per_block[1]
+  raise ValueError(f"GGML type '{ggml_type}' is not supported!")
+
 def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
-  # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
+  # Keep the file on DISK (mmap) and stage each tensor to the default device individually. The header reads need
+  # only tiny slices, and each dequant reads its tensor from its own small buffer. A single whole-file device
+  # buffer is neither needed nor safe: on drivers where a compute buffer whose GPU VA span crosses a 2^32 (4 GiB)
+  # boundary faults (e.g. RADV on gfx9 APUs), the multi-GiB file buffer silently corrupts the dequant reads.
+  tensor = tensor.realize()
   r = io.BufferedReader(TensorIO(tensor), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
@@ -210,7 +218,10 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  state_dict = {}
+  for name, dims, typ, off in t_infos:
+    entry = tensor[data_start + off : data_start + off + _gguf_nbytes(prod(dims), typ)].to(None).realize()
+    state_dict[name] = ggml_data_to_tensor(entry, prod(dims), typ).reshape(*reversed(dims))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:

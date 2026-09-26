@@ -650,12 +650,22 @@ class VkRt:
         if self._ncmd >= CB_FLUSH_MAX and not self._in_kernel: self.submit()
         self._ncmd += 1
 
+    # RADV (mesa 26.1.6, RENOIR) silently truncates H2D vkCmdCopyBuffers above a
+    # non-deterministic size (~0.4-2 GiB observed): the destination keeps its first N bytes
+    # and the rest stays zero, no error is reported. D2H is unaffected. Chunk to stay below
+    # the smallest observed boundary (0.389 GiB tensor landed, 1.02 GiB tensor truncated at
+    # 0.406 GiB) (see extra/vulkan/RADV_BIGCOPY.md).
+    COPY_CHUNK = 256 * 1024 * 1024
     def cmd_copy(self, dst, src, size=None, src_off=0, dst_off=0):
         n = size if size is not None else min(dst.size, src.size)
         if self._per_kernel_submit: self.submit()  # this copy must not share a cb with a dispatch
         self._begin_cmd()
-        cp = VkBufferCopy(srcOffset=src_off, dstOffset=dst_off, size=n)
-        vkCmdCopyBuffer(self.cbs[self._slot], _handle(src), _handle(dst), 1, C.byref(cp))
+        done = 0
+        while done < n:
+            c = min(self.COPY_CHUNK, n - done)
+            cp = VkBufferCopy(srcOffset=src_off + done, dstOffset=dst_off + done, size=c)
+            vkCmdCopyBuffer(self.cbs[self._slot], _handle(src), _handle(dst), 1, C.byref(cp))
+            done += c
 
     def cmd_bind_pipeline(self, pipeline):
         # a kernel starts here; flush the pending cb at a kernel boundary (RADV: every
