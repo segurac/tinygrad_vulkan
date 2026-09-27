@@ -52,6 +52,9 @@ _RESULTS = {
 # in-flight submits allowed: the (command buffer, fence) ring depth. submit() only blocks
 # (backpressure) when it wraps around to a slot whose fence has not signaled yet.
 RING = 8
+# VK_BATCH_SEM: (command buffer, binary semaphore) arena size. One CBT per kernel/copy in a
+# step (a 1290-kernel decode step needs ~1291 CBTs), chained in one submit; 4096 leaves headroom.
+POOL = 4096
 # flush points for the pending (unsubmitted) command buffer, so the fence ring keeps
 # cycling and the CPU can't outrun the GPU by an unbounded count. CB_FLUSH_KERNELS is the
 # normal point (a kernel's bind/bdesc/dispatch must never be split across cbs: a dispatch
@@ -73,6 +76,7 @@ VK_SHARING_MODE_EXCLUSIVE = 0
 VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0
 VK_PIPELINE_BIND_POINT_COMPUTE = 1
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
+VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x800
 VK_ACCESS_SHADER_READ_BIT = 0x2000
 VK_ACCESS_SHADER_WRITE_BIT = 0x4000
 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6
@@ -87,6 +91,7 @@ ST_DEVICE_QUEUE_CREATE_INFO = 2
 ST_DEVICE_CREATE_INFO = 3
 ST_SUBMIT_INFO = 4
 ST_MEMORY_ALLOCATE_INFO = 5
+ST_SEMAPHORE_CREATE_INFO = 9
 ST_FENCE_CREATE_INFO = 8
 ST_BUFFER_CREATE_INFO = 12
 ST_SHADER_MODULE_CREATE_INFO = 16
@@ -216,6 +221,11 @@ class VkSubmitInfo(C.Structure):
 class VkFenceCreateInfo(C.Structure):
     _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("flags", c_uint32)]
 
+class VkSemaphoreCreateInfo(C.Structure):
+    # default (no flags) creates a binary semaphore: auto-reset on the wait that consumes it,
+    # so a semaphore chained through a submit needs no explicit reset between batches
+    _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("flags", c_uint32)]
+
 class VkMemoryType(C.Structure):
     _fields_ = [("propertyFlags", c_uint32), ("heapIndex", c_uint32)]
 
@@ -277,6 +287,8 @@ vkCmdDispatch = _vk("vkCmdDispatch", _v + [c_uint32, c_uint32, c_uint32], _N)
 vkCreateFence = _vk("vkCreateFence", _v + _v + _v + [C.POINTER(c_void_p)])
 vkDestroyFence = _vk("vkDestroyFence", _v + _v + _v, _N)
 vkResetFences = _vk("vkResetFences", _v + [c_uint32] + _v)
+vkCreateSemaphore = _vk("vkCreateSemaphore", _v + _v + _v + [C.POINTER(c_void_p)])
+vkDestroySemaphore = _vk("vkDestroySemaphore", _v + _v + _v, _N)
 vkQueueSubmit = _vk("vkQueueSubmit", _v + [c_uint32] + 2 * _v)
 vkWaitForFences = _vk("vkWaitForFences", _v + [c_uint32] + _v + [c_uint32, c_uint64])
 vkCreateShaderModule = _vk("vkCreateShaderModule", _v + _v + _v + [C.POINTER(c_void_p)])
@@ -408,18 +420,6 @@ class VkRt:
         pool = c_void_p()
         _check("vkCreateCommandPool", vkCreateCommandPool(dev, C.byref(cpci), None, C.byref(pool)))
         self.cmd_pool = pool
-        cba = VkCommandBufferAllocateInfo(sType=ST_COMMAND_BUFFER_ALLOCATE_INFO, commandPool=pool,
-                                           level=VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=RING)
-        cbs = (c_void_p * RING)()
-        _check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(dev, C.byref(cba), cbs))
-        self.cbs, self._cb_active = cbs, False
-        # self._slot is the ring slot the active command buffer belongs to (or the next one
-        # to begin). self._inflight[i]: fence i was submitted and has not been waited on.
-        # self._ncmd: commands recorded in the active command buffer.
-        # self._poisoned[i]: slot i's fence timed out once; see _wait_fence.
-        self._slot, self._inflight, self._ncmd = 0, [False] * RING, 0
-        self._poisoned = [False] * RING
-        self._cb_has_dispatch, self._nkernels, self._in_kernel = False, 0, False
         # the NV 550 driver does not make one dispatch's stores visible to the next
         # dispatch's loads within a single command buffer; an explicit compute->compute
         # memory barrier between dispatches in the same cb restores ordering. VK_BARRIER=0
@@ -437,6 +437,50 @@ class VkRt:
         # Retested on mesa 26.1.6 (RADV gfx10.3, sync submits): still broken -- batched cbs
         # (VK_PER_KERNEL=0) give nan loss from step 1, the in-cb visibility bug survives.
         self._per_kernel_submit = os.environ.get("VK_PER_KERNEL", "1" if self.vendor in (0x1002, 0x5143) else "0") == "1"
+        # VK_BATCH_SEM=1 (default 0): the per-CBT behavior of _per_kernel_submit above, minus
+        # the per-unit submit+fence-wait. Every kernel dispatch and every copy still gets its
+        # OWN primary command buffer (RADV's in-cb visibility bug, above), but instead of
+        # submit()+fence-wait per unit, each finished CBT is ended and queued in
+        # _batch_pending, and one vkQueueSubmit of N chained VkSubmitInfo entries is issued at
+        # the next submit() boundary: entry 0 signals semaphore 0, entry i (0<i<N-1) waits
+        # semaphore i-1 and signals semaphore i, entry N-1 waits semaphore N-2 and signals
+        # none; a single fence (fences[0]) covers the whole submit. The binary semaphores make
+        # each CBT start only after the previous one has completed (with memory visibility),
+        # so the GPU runs the whole step's kernels back-to-back with no ~24-30us CPU gap to
+        # drop into -- which is what lets DPM SCLK stay at 2000 MHz instead of bouncing to
+        # 400 MHz between per-kernel submits. Micro-evidence: two CBTs in one submit chained
+        # by a binary semaphore were bit-exact at 256KB-64MiB / 1000 iters, +4us/op vs an
+        # in-cb barrier (/work/opencode/radv_batch/RADV_BATCHING.md); model-scale verification
+        # was the open question. VK_BATCH_SEM_CHUNK=N splits the pending batch into submits of
+        # N chained CBTs (N=1 reproduces today's per-kernel submit) -- a diagnostic/fallback if
+        # the visibility bug turns out to extend to long semaphore chains at model scale.
+        self._batch_sem = os.environ.get("VK_BATCH_SEM", "0") == "1"
+        self._batch_chunk = int(os.environ.get("VK_BATCH_SEM_CHUNK", "0")) or POOL
+        self._cb_pool = POOL if self._batch_sem else RING
+        cba = VkCommandBufferAllocateInfo(sType=ST_COMMAND_BUFFER_ALLOCATE_INFO, commandPool=pool,
+                                           level=VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount=self._cb_pool)
+        cbs = (c_void_p * self._cb_pool)()
+        _check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(dev, C.byref(cba), cbs))
+        self.cbs, self._cb_active = cbs, False
+        # self._slot: the CBT the active command buffer belongs to (or the next one to begin);
+        # indexes self.cbs and wraps at self._cb_pool (RING normally, POOL in VK_BATCH_SEM).
+        # self._inflight[i]/self._poisoned[i]: per-slot fence state, non-batch mode (see
+        # _wait_fence); in VK_BATCH_SEM the whole batch shares fence 0 and _batch_inflight
+        # tracks the submitted-not-waited cbs instead. self._ncmd: commands in the active cb.
+        self._slot, self._ncmd = 0, 0
+        self._inflight, self._poisoned = [False] * self._cb_pool, [False] * self._cb_pool
+        self._cb_has_dispatch, self._nkernels, self._in_kernel = False, 0, False
+        if self._batch_sem:
+            # semaphore arena: one binary semaphore per CBT slot (a batch of N cbs chains
+            # through semaphores 0..N-2). Allocated once; never reset (auto-reset on wait).
+            self._batch_pending = []
+            self._batch_inflight = set()
+            self._batch_sems = (c_void_p * POOL)()
+            for i in range(POOL):
+                sci = VkSemaphoreCreateInfo(sType=ST_SEMAPHORE_CREATE_INFO)
+                out = c_void_p()
+                _check("vkCreateSemaphore", vkCreateSemaphore(dev, C.byref(sci), None, C.byref(out)))
+                self._batch_sems[i] = out
 
         self.fences = (c_void_p * RING)()
         for i in range(RING):
@@ -634,9 +678,16 @@ class VkRt:
 
     def _ensure_cb(self):
         if not self._cb_active:
-            # backpressure: wrapping back to a slot whose submit is still in flight; its
-            # command buffer must be idle before it can be reset and re-recorded
-            if self._inflight[self._slot]: self._wait_fence(self._slot)
+            if self._batch_sem:
+                # backpressure: the CBT pool would be exhausted (every cb still pending and
+                # not yet submitted) or the cursor wrapped to a cb whose batch is still in
+                # flight; flush/wait so the cb is idle before it can be reset and re-recorded
+                if len(self._batch_pending) + 1 > self._cb_pool or self._slot in self._batch_inflight:
+                    self._batch_submit(wait=True)
+            else:
+                # backpressure: wrapping back to a slot whose submit is still in flight; its
+                # command buffer must be idle before it can be reset and re-recorded
+                if self._inflight[self._slot]: self._wait_fence(self._slot)
             _check("vkResetCommandBuffer", vkResetCommandBuffer(self.cbs[self._slot], 0))
             bi = VkCommandBufferBeginInfo(sType=ST_COMMAND_BUFFER_BEGIN_INFO)
             _check("vkBeginCommandBuffer", vkBeginCommandBuffer(self.cbs[self._slot], C.byref(bi)))
@@ -658,7 +709,10 @@ class VkRt:
     COPY_CHUNK = 256 * 1024 * 1024
     def cmd_copy(self, dst, src, size=None, src_off=0, dst_off=0):
         n = size if size is not None else min(dst.size, src.size)
-        if self._per_kernel_submit: self.submit()  # this copy must not share a cb with a dispatch
+        # this copy must not share a cb with a dispatch: end the pending unit's cb and either
+        # submit it now (per-kernel mode) or queue it for the next chained submit (batch mode)
+        if self._batch_sem: self._batch_end_unit()
+        elif self._per_kernel_submit: self.submit()
         self._begin_cmd()
         done = 0
         while done < n:
@@ -670,7 +724,9 @@ class VkRt:
     def cmd_bind_pipeline(self, pipeline):
         # a kernel starts here; flush the pending cb at a kernel boundary (RADV: every
         # kernel, others: every CB_FLUSH_KERNELS) so this kernel's commands stay together
-        if self._cb_active and (self._per_kernel_submit or self._nkernels >= CB_FLUSH_KERNELS):
+        if self._batch_sem:
+            self._batch_end_unit()  # this kernel gets its own cb, queued for the next chained submit
+        elif self._cb_active and (self._per_kernel_submit or self._nkernels >= CB_FLUSH_KERNELS):
             self.submit()
         self._ensure_cb()
         vkCmdBindPipeline(self.cbs[self._slot], VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle)
@@ -697,6 +753,79 @@ class VkRt:
         vkCmdDispatch(self.cbs[self._slot], x, y, z)
         self._cb_has_dispatch, self._in_kernel = True, False
 
+    # -- VK_BATCH_SEM: per-CBT, semaphore-chained submits --
+
+    def _batch_end_unit(self):
+        # end the active unit's command buffer and queue it for the next chained submit; the
+        # unit will run after the earlier pending units via binary semaphores. No submit here.
+        if not self._cb_active: return
+        i = self._slot
+        _check("vkEndCommandBuffer", vkEndCommandBuffer(self.cbs[i]))
+        self._batch_pending.append(i)
+        self._slot = (i + 1) % self._cb_pool
+        self._cb_active = False
+
+    def _wait_batch_fence(self, timeout_ns=30_000_000_000):
+        # wait on the batch fence (fences[0]); it signals when the whole submitted chain is
+        # done. Clears _batch_inflight (every cb in the chain is now idle and reusable).
+        f = C.cast((c_void_p * 1)(self.fences[0]), c_void_p)
+        if (res := vkWaitForFences(self.device, 1, f, 1, timeout_ns)) == VK_TIMEOUT:
+            raise VkError("vkWaitForFences", VK_TIMEOUT)
+        if res != VK_SUCCESS: _check("vkWaitForFences", res)
+        self._batch_inflight.clear()
+
+    def _submit_chain(self, cbs, do_wait, timeout_ns):
+        # one vkQueueSubmit of len(cbs) chained VkSubmitInfo entries over fence 0: entry 0
+        # signals semaphore 0, entry i (0<i<n-1) waits semaphore i-1 and signals semaphore i,
+        # entry n-1 waits semaphore n-2 and signals none. The semaphores make each cb start
+        # only after the previous has completed (with memory visibility), preserving the
+        # per-unit ordering the RADV in-cb bug requires. fence 0 must not be in flight here
+        # (true on RADV: every submit waits before returning). pWaitDstStageMask must be
+        # non-NULL when waiting: RADV 26.1.6 segfaults on NULL (see RADV_BATCHING.md, f1).
+        n = len(cbs)
+        sies = (VkSubmitInfo * n)()
+        cb_arr = (c_void_p * n)()
+        masks = (c_uint32 * n)()
+        for i in range(n):
+            cb_arr[i] = self.cbs[cbs[i]]
+            masks[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            sies[i].sType = ST_SUBMIT_INFO
+            sies[i].pNext = None
+            sies[i].commandBufferCount = 1
+            # NOTE: C.byref(arr, off) takes a BYTE offset, not an element index
+            sies[i].pCommandBuffers = C.cast(C.byref(cb_arr, i * C.sizeof(c_void_p)), c_void_p)
+            if i > 0:
+                sies[i].waitSemaphoreCount = 1
+                sies[i].pWaitSemaphores = C.cast(C.byref(self._batch_sems, (i - 1) * C.sizeof(c_void_p)), c_void_p)
+                sies[i].pWaitDstStageMask = C.cast(C.byref(masks, (i - 1) * C.sizeof(c_uint32)), c_void_p)
+            if i < n - 1:
+                sies[i].signalSemaphoreCount = 1
+                sies[i].pSignalSemaphores = C.cast(C.byref(self._batch_sems, i * C.sizeof(c_void_p)), c_void_p)
+        # fence 0 must not be in flight when we reset it; if a prior chain is still out
+        # there (only possible with VK_ASYNC=1, unsupported on RADV) wait it out first
+        if self._batch_inflight: self._wait_batch_fence(timeout_ns)
+        _check("vkResetFences", vkResetFences(self.device, 1, C.cast((c_void_p * 1)(self.fences[0]), c_void_p)))
+        self._batch_inflight.update(cbs)
+        _check("vkQueueSubmit", vkQueueSubmit(self.queue, n, sies, self.fences[0]))
+        if do_wait: self._wait_batch_fence(timeout_ns)
+
+    def _batch_submit(self, wait:bool=False, timeout_ms:int|None=None):
+        """VK_BATCH_SEM: end any active unit's cb, then issue one vkQueueSubmit of chained
+        VkSubmitInfo entries for every pending cb (split into _batch_chunk-sized submits),
+        each covered by fence 0. wait / not self._async blocks until the fence signals
+        (RADV: always -- the GPU then runs the whole batch with no CPU gaps, the point)."""
+        if self._cb_active: self._batch_end_unit()
+        if not self._batch_pending: return VK_SUCCESS
+        timeout_ns = (timeout_ms if timeout_ms is not None else 30000) * 1_000_000
+        do_wait = wait or not self._async
+        i, n = 0, len(self._batch_pending)
+        while i < n:
+            chunk = self._batch_pending[i:i + self._batch_chunk]
+            self._submit_chain(chunk, do_wait, timeout_ns)
+            i += len(chunk)
+        self._batch_pending = []
+        return VK_SUCCESS
+
     def submit(self, wait:bool=False, timeout_ms:int|None=None):
         """End the pending command buffer and submit it with its ring slot's fence; a
         no-op when nothing is pending. wait=False returns immediately (the work is in
@@ -705,7 +834,10 @@ class VkRt:
         instead of blocking forever). On drivers that need it (self._async is False,
         e.g. RADV on this APU) every submit waits on its fence: the next in-order
         dispatch must not start before this submit's stores are visible, so the ring
-        never runs deeper than one."""
+        never runs deeper than one. In VK_BATCH_SEM this instead flushes the accumulated
+        per-unit command buffers as one semaphore-chained submit (see _batch_submit)."""
+        if self._batch_sem:
+            return self._batch_submit(wait, timeout_ms)
         if not self._cb_active:
             return VK_SUCCESS
         timeout_ns = (timeout_ms if timeout_ms is not None else 30000) * 1_000_000
@@ -731,6 +863,10 @@ class VkRt:
     def synchronize(self, timeout_ms:int|None=None):
         """Flush the pending command buffer (if any), then wait for every in-flight
         submit (all pending fences in the ring)."""
+        if self._batch_sem:
+            # the whole pending batch is one submit on fence 0; flush it and wait on it
+            self._batch_submit(wait=True, timeout_ms=timeout_ms)
+            return
         timeout_ns = (timeout_ms if timeout_ms is not None else 30000) * 1_000_000
         self.submit(wait=False)
         for i in range(RING):
@@ -757,8 +893,11 @@ class VkRt:
         for d in self._dsls:
             vkDestroyDescriptorPool(self.device, d.pool, None)
             vkDestroyDescriptorSetLayout(self.device, d.layout, None)
-        vkFreeCommandBuffers(self.device, self.cmd_pool, RING, C.cast(self.cbs, c_void_p))
+        vkFreeCommandBuffers(self.device, self.cmd_pool, self._cb_pool, C.cast(self.cbs, c_void_p))
         vkDestroyCommandPool(self.device, self.cmd_pool, None)
+        if self._batch_sem:
+            for i in range(POOL):
+                vkDestroySemaphore(self.device, self._batch_sems[i], None)
         for i in range(RING):
             vkDestroyFence(self.device, self.fences[i], None)
         vkDestroyDevice(self.device, None)
