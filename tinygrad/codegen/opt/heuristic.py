@@ -79,7 +79,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             return k
 
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.full_shape[i] for i in k.upcastable_dims) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
+  if resolve(prod(k.full_shape[i] for i in k.upcastable_dims) <= (240 if k.ren.target.device == "QCOM" else 4096), False):
     for axis, sz in itertools.product(k.axes_of(AxisType.REDUCE)[:3], (16,)):
       try:
         k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.LOCAL, True)))
