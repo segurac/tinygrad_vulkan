@@ -3,7 +3,9 @@ import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels import vulkan as _vulkan
 from tinygrad.llm.gguf import gguf_load
+from tinygrad.helpers import prod
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -38,8 +40,23 @@ class ExpertWeights:
   def __init__(self, num_experts:int, in_features:int, out_features:int, bias:bool=False):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
     if bias: self.bias = Tensor.zeros(num_experts, out_features)
+    self.num_experts, self.in_features, self.out_features = num_experts, in_features, out_features
+    self._vq: Tensor|None = None
+    self._vq5: Tensor|None = None
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    if resolve(prod(x.shape[:-2]) == 1) and _vulkan.vulkan_quant_supported(self.weight.device):
+      # decode-only fused gather GEMV reading the quantized bytes directly (llama.cpp MoE kernel style)
+      if self._vq5 is None and self.in_features == 512 and _vulkan.vulkan_q5k_enabled(self.weight.device):
+        self._vq5 = _vulkan.find_q5k_bytes(self.weight)
+      if self._vq5 is not None:
+        ret = _vulkan.vulkan_q5k_expert_linear(self._vq5, sel, x, self.in_features, self.out_features, self.num_experts)
+        return ret + self.bias[sel] if hasattr(self, 'bias') else ret
+      if resolve(prod(x.shape[:-1]) == 1):   # the Q4_K kernel assumes one x row shared by all experts (gate/up)
+        if self._vq is None: self._vq = _vulkan.find_q4k_expert_bytes(self.weight)
+        if self._vq is not None:
+          ret = _vulkan.vulkan_q4k_expert_linear(self._vq, sel, x, self.in_features, self.out_features, self.num_experts)
+          return ret + self.bias[sel] if hasattr(self, 'bias') else ret
     ret = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
     return ret + self.bias[sel] if hasattr(self, 'bias') else ret
 

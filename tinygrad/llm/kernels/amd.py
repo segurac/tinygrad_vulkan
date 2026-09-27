@@ -3,6 +3,7 @@ import functools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.kernels import vulkan as _vulkan
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
@@ -64,6 +65,7 @@ class Linear(nn.Linear):
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
+    self._vq: Tensor|None = None
   def set_quantized(self, decoded:Tensor):
     if self.in_features % GGML_BLOCK_SIZE: return
     packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
@@ -89,6 +91,11 @@ class Linear(nn.Linear):
     self.ggml_type = ggml_type
     self.weight = Tensor(raw).bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
+    if x.numel() == self.in_features:
+      if self._vq is None and _vulkan.vulkan_q4k_enabled(self.weight.device):
+        self._vq = _vulkan.find_q4k_bytes(self.weight)
+      if self._vq is not None:
+        return _vulkan.vulkan_q4k_linear(self._vq, x, self.in_features, self.out_features)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
