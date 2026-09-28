@@ -31,6 +31,17 @@ def strip_binary_parens(x:UOp, left:str, right:str, code_for_op) -> str:
   return code_for_op(strip_parens(left) if precedence.get(x.src[0].op,99)<=precedence[x.op] else left, strip_parens(right) if
     precedence.get(x.src[1].op,99)<precedence[x.op] else right)
 
+# marg is ssimplify'd, so a bound can be a node this graph never contained
+def marg_str(ctx, a:sint) -> str: return str(a) if not isinstance(a, UOp) else ctx[a] if a in ctx else a.render()
+
+def render_marg(ctx,x:UOp):
+  if x.op is Ops.PERMUTE: return str(x.marg)
+  if x.op is Ops.FLIP: return str(tuple([i for i,x in enumerate(x.marg) if x]))
+  pieces = []
+  if x.op in {Ops.RESHAPE, Ops.EXPAND}: pieces = [marg_str(ctx, a) for a in x.marg]
+  if x.op in {Ops.PAD, Ops.SHRINK}: pieces = [f"({marg_str(ctx, a[0])}, {marg_str(ctx, a[1])})" for a in x.marg]
+  return f"({','.join(pieces)})" if len(pieces) != 1 else f"({pieces[0]},)"
+
 renderer = PatternMatcher([
   (UPat(Ops.PARAM, name="x"), lambda x: x.arg.name if x.arg.name is not None else f"p{x.arg.slot}"),
   (UPat((Ops.BUFFER, Ops.ALLOC), name="x"), lambda x:
@@ -71,16 +82,6 @@ renderer_infer = PatternMatcher([
 # *** pyrender ***
 
 def srcs(ctx, src): return f"({ctx[src[0]]},)" if len(src) == 1 else f"({', '.join([ctx[x] for x in src])})"
-# marg is ssimplify'd, so a bound can be a node this graph never contained
-def marg_str(ctx, a:sint) -> str: return str(a) if not isinstance(a, UOp) else ctx[a] if a in ctx else a.render()
-
-def render_marg(ctx,x:UOp):
-  if x.op is Ops.PERMUTE: return str(x.marg)
-  if x.op is Ops.FLIP: return str(tuple([i for i,x in enumerate(x.marg) if x]))
-  pieces = []
-  if x.op in {Ops.RESHAPE, Ops.EXPAND}: pieces = [marg_str(ctx, a) for a in x.marg]
-  if x.op in {Ops.PAD, Ops.SHRINK}: pieces = [f"({marg_str(ctx, a[0])}, {marg_str(ctx, a[1])})" for a in x.marg]
-  return f"({','.join(pieces)})" if len(pieces) != 1 else f"({pieces[0]},)"
 
 sugar = {Ops.SINK, Ops.END, Ops.BACKEDGE, Ops.STORE, Ops.LOAD, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER, Ops.THREEFRY,
          Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.BARRIER, Ops.DETACH}
@@ -88,10 +89,11 @@ pm_pyrender_extra = PatternMatcher([
   (UPat(Ops.CONST, src=(), name="x"), lambda x: f"UOp.const({x.val})"),
   (UPat((Ops.CAST, Ops.BITCAST), name="x"), lambda ctx,x: f"{ctx[x.src[0]]}.{x.op.name.lower()}({x.dtype})" if x.dtype != x.src[0].dtype else None),
   (UPat(Ops.SPECIAL, src=(UPat(Ops.CONST),), name="x"), lambda x: f"UOp.special({x.src[0].val}, {repr(x.arg)})"),
-  (UPat(Ops.BUFFER, src=(), name="x"), lambda x:
+  # NOTE: multi-device buffers carry the DEVICE range in src, new_buffer recreates it
+  (UPat(Ops.BUFFER, name="x"), lambda x:
     f"UOp.new_buffer({repr(x.arg.device)}, {x.max_numel()}, {x.dtype}, {x.arg.slot})"
     if isinstance(x.arg, ParamArg) and x.addrspace is AddrSpace.GLOBAL else None),
-  (UPat(Ops.COPY, src=(UPat(name="x"),), name="copy"), lambda ctx,x,copy: f"{ctx[x]}.copy_to_device({repr(copy.arg)})"),
+  (UPat(Ops.COPY, src=(UPat(name="x"),), allow_any_len=True, name="copy"), lambda ctx,x,copy: f"{ctx[x]}.copy_to_device({repr(copy.arg)})"),
   (UPat(Ops.CUSTOM_FUNCTION, name="x"), lambda ctx,x: f"UOp(Ops.CUSTOM_FUNCTION, src={srcs(ctx, x.src)}, arg={x.arg!r})"),
   (UPat(Ops.REDUCE, name="r"), lambda ctx,r: f"{ctx[r.src[0]]}._rop({r.arg[0]}, {tuple(range(r.arg[1]))})" if r.arg[1] else None),
   # NOTE: range has srcs sometimes after control flow

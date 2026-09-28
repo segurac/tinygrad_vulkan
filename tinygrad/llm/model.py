@@ -438,7 +438,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * self.head_k_dim**-0.5
-    alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, V|1)
+    alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     # carry the conv write into this graph (the fused conv path updates conv_state inside its kernel)
@@ -458,7 +458,7 @@ class GatedDeltaNetBlock(FFNBlock):
         core = core.reshape(B, T, self.num_v_heads, self.head_v_dim)
     if core is None:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
-      alpha = alpha.unsqueeze(-1)
+      alpha = alpha.unsqueeze(-2)
       state = initial.where(0, state.float())
       outs = []
       for t in range(T_pad):

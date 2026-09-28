@@ -282,7 +282,7 @@ TUPLE_ORDER = ContextVar("TUPLE_ORDER", 1)
 CCACHE = ContextVar("CCACHE", 1)
 # allow tf32 to be used on NVIDIA GPUs
 ALLOW_TF32 = ContextVar("ALLOW_TF32", 0)
-# set to 0 to disable the scheduler cache
+# set to 0 to disable the scheduler cache, 2 to also persist it to disk
 SCACHE = ContextVar("SCACHE", 1)
 # allow use of atomics for embedding backward
 USE_ATOMICS = ContextVar("USE_ATOMICS", 0)
@@ -537,9 +537,10 @@ def system(cmd:str, **kwargs) -> str:
   return ret
 
 def cpu_objdump(lib, objdump_tool='objdump'):
-  with tempfile.NamedTemporaryFile(delete=True) as f:
-    pathlib.Path(f.name).write_bytes(lib)
-    print(system(f"{objdump_tool} -d {f.name}"))
+  with tempfile.TemporaryDirectory() as tmpdir:
+    path = pathlib.Path(tmpdir) / "kernel.o"
+    path.write_bytes(lib)
+    print(system(f"{objdump_tool} -d {path}"))
 
 def capstone_flatdump(lib: bytes, arch:str):
   try: import capstone

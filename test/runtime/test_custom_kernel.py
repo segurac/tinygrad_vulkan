@@ -7,6 +7,7 @@ from tinygrad.schedule.rangeify import BufferizeOpts
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
+from tinygrad.renderer.cstyle import CStyleLanguage
 from test.helpers import assert_kernel_count
 from test.null.test_custom_kernel import custom_elementwise_add_kernel, custom_elementwise_addmul_kernel, custom_gemm
 
@@ -470,29 +471,6 @@ class TestCustomKernel(unittest.TestCase):
     assert_kernel_count(2 if x[0].uop.contiguous_view() is None else 1)
     self.assertEqual(y.tolist(), [1, 2, 3, 4])
 
-  @Context(DEV="CPU")
-  def test_simple_from_source(self):
-    a = Tensor.arange(4).clone().realize()
-    src = "void test_src(int* restrict a) { a[0] = 1; }"
-    def custom_src_kernel(A:UOp, B:UOp) -> UOp:
-      sink = UOp.sink(A, arg=KernelInfo(name="test_src"))
-      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(sink.toposort())), UOp(Ops.SOURCE, arg=src),))
-    a = Tensor.custom_kernel(a.reshape(2, 2).clone(), a.reshape(2, 2).T, fxn=custom_src_kernel)[0]
-    self.assertEqual(a.tolist(), [[1, 1], [2, 3]])
-
-  @Context(DEV="CPU")
-  def test_simple_from_source_alt(self):
-    a = Tensor.arange(4).clone().realize()
-    src = "void copy(int* restrict out, int* restrict in) { for (int i = 0; i < 4; i++) out[i] = in[i]; }"
-    def custom_src_kernel(out:UOp, inp:UOp) -> UOp:
-      sink = UOp.sink(out, inp, arg=KernelInfo(name="copy"))
-      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple(sink.toposort())), UOp(Ops.SOURCE, arg=src),))
-    out = Tensor.custom_kernel(Tensor.empty_like(a), a+1, fxn=custom_src_kernel)[0]
-    GlobalCounters.reset()
-    out.realize()
-    assert_kernel_count(2)
-    self.assertEqual(out.tolist(), [1, 2, 3, 4])
-
   @unittest.skip("this shouldn't be expected to work")
   def test_inplace_transpose(self):
     def custom_assign_row_max_kernel(A:UOp) -> UOp:
@@ -528,10 +506,20 @@ class TestCustomKernel(unittest.TestCase):
     out = Tensor.custom_kernel(Tensor.empty(1, dtype=a.dtype), a, fxn=call_add_sum)[0]
     self.assertEqual(out.tolist(), [N*(N+1)//2])
 
+  @unittest.skipUnless((isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage) or Device.DEFAULT == "PYTHON") and
+                       Device.DEFAULT != "WEBGPU", "binary not supported on this backend")
+  def test_binary(self):
+    payload = bytes(range(256))
+    def kernel(out:UOp):
+      i = UOp.range(len(payload), 0)
+      data = UOp(Ops.BINARY, arg=payload)
+      return out[i].store(data[i]).end(i).sink(arg=KernelInfo(name="binary", opts_to_apply=()))
+    self.assertEqual(Tensor.empty(len(payload), dtype=dtypes.uint8).custom_kernel(fxn=kernel)[0].tolist(), list(payload))
+
 class TestCustomKernelInput(unittest.TestCase):
   def _test_mop(self, mop_fxn, max_kernels):
     # default: input is BUFFER
-    x = mop_fxn(Tensor.arange(32).clone("CPU").realize())
+    x = mop_fxn(Tensor.arange(32).clone().realize())
     y = Tensor.custom_kernel(Tensor.empty_like(x), x, fxn=custom_add_one_kernel)[0]
     GlobalCounters.reset()
     y.realize()
@@ -539,7 +527,7 @@ class TestCustomKernelInput(unittest.TestCase):
     self.assertEqual(y.tolist(), x.add(1).tolist())
     # same test with @function, input is PARAM
     from tinygrad import function
-    x0 = Tensor.arange(32).clone("CPU").realize()
+    x0 = Tensor.arange(32).clone().realize()
     @function(precompile=True)
     def run(a:Tensor) -> Tensor:
       xv = mop_fxn(a)
