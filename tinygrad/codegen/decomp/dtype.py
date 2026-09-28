@@ -107,8 +107,11 @@ def f2f(v, fr:DType, to:DType, sat=True):
     if fr in dtypes.fp8_fnuz:
       fnuz_nan = sign.ne(0) & nosign.eq(0)
       qnan = shl(shl(1, te) - 1, tm) | shl(1, tm - 1)
-      # the fnuz bias can exceed the target's: exp in [1, fb-tb] is normal in fr but lands below to's normal range, so it flushes like a denormal
-      return fnuz_nan.where(qnan, sign | (exp < max(fb - tb, 0) + 1).where(0, norm)).bitcast(to)
+      # the fnuz bias can exceed the target's: the smallest normals (exp in [1, fb-tb]) and the denormals
+      # (exp==0) land in to's denormal range; emit their denormal mantissa (nosign on to's denormal grid)
+      # instead of flushing to zero, which would lose values the target can still represent
+      denorm = (exp < fb - tb + 1).where(shl(nosign, tm - 1 - fm), norm) if fb > tb else (exp < 1).where(0, norm)
+      return fnuz_nan.where(qnan, sign | denorm).bitcast(to)
     # fp8e4m3 has only one nan
     is_nan = (nosign.eq(shl(1, fm + fe) - 1) if fr == dtypes.fp8e4m3 else exp.eq(shl(1, fe) - 1))
     # a denormal is exact in the wider target: an integer mantissa times a power of two
@@ -124,7 +127,9 @@ def f2f(v, fr:DType, to:DType, sat=True):
     v = f2f_clamp(v.bitcast(fr), to, sat).bitcast(f2f_dt[fr])
     sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
     norm = (rne(nosign, fm - tm) - shl(fb - tb, tm)).cast(f2f_dt[to])
-    underflow = (shr(v, fm) & (shl(1, fe) - 1)) < (1 + fb - tb)
+    # the threshold must stay >= 1 so a zero/denormal source (exp field 0) flushes; clamp for the fnuz
+    # target whose bias exceeds the source's (otherwise the bound goes <= 0 and zero takes the norm path)
+    underflow = (shr(v, fm) & (shl(1, fe) - 1)) < (max(fb - tb, 0) + 1)
     nan_mantissa = (shl(1, tm) - 1) if to == dtypes.fp8e4m3 else (shr(nosign, fm - tm) & (shl(1, tm) - 1))
     nan = (sign | nan_mantissa | shl(shl(1, te) - 1, tm)).cast(f2f_dt[to])
     is_nan = (shr(v, fm) & (shl(1, fe) - 1)).eq(shl(1, fe) - 1)
