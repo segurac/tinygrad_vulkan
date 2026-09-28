@@ -182,11 +182,14 @@ class FFNBlock:
           and isinstance(n, int) and isinstance(k, int) and resolve(prod(x.shape[:-1]) == 1)
           and _vulkan.vulkan_router_enabled(x.device)):
         # decode (B*T==1) raw-logits fast path: keep the model's own gemv (logits) and rank kernels and
-        # fuse the sel-scatter + gather + softmax into one no-local-memory kernel (4 kernels -> 1)
+        # fuse the sel-scatter + gather + softmax (v1: one no-local-memory kernel; VULKAN_ROUTERV2: a
+        # parallel scatter + 1-item softmax pair, no 256-iter scans)
         idx = Tensor.arange(n).reshape(1, 1, n)
         cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | \
               ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & (idx.unsqueeze(-1) < idx.unsqueeze(-2)))
-        fused = _vulkan.vulkan_moe_selprob(cmp.sum(axis=-1).cast('int32'), logits, n, k)
+        r = cmp.sum(axis=-1).cast('int32')
+        fused = _vulkan.vulkan_moe_selprob_v2(r, logits, n, k) if _vulkan.vulkan_router_v2_enabled(x.device) \
+                else _vulkan.vulkan_moe_selprob(r, logits, n, k)
       if fused is not None:
         sel, probs = fused
       else:

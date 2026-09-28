@@ -61,6 +61,8 @@ class Linear(nn.Linear):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
     self._vq: Tensor|None = None
+    self._vq8: Tensor|None = None
+    self._vq6d: Tensor|None = None
   def set_quantized(self, decoded:Tensor):
     if self.in_features % GGML_BLOCK_SIZE: return
     packed_sizes = {typ: decoded.numel() // 256 * type_size for typ,type_size in QUANT_SIZES.items()}
@@ -91,6 +93,16 @@ class Linear(nn.Linear):
         self._vq = _vulkan.find_q4k_bytes(self.weight)
       if self._vq is not None:
         return _vulkan.vulkan_q4k_linear(self._vq, x, self.in_features, self.out_features)
+      if self.bias is None and self._vq8 is None and (
+          _vulkan.vulkan_q80_qkv_enabled(self.weight.device) if (self.in_features, self.out_features) == (2048, 8192)
+          else _vulkan.vulkan_q80_dense_enabled(self.weight.device)):
+        self._vq8 = _vulkan.find_q80_bytes_a2(self.weight)
+      if self._vq8 is not None:
+        return _vulkan.vulkan_q80_linear(self._vq8, x, self.in_features, self.out_features)
+      if self._vq6d is None and _vulkan.vulkan_q6k_dense_enabled(self.weight.device):
+        self._vq6d = _vulkan.find_q6k_bytes_a2(self.weight)
+      if self._vq6d is not None:
+        return _vulkan.vulkan_q6k_linear(self._vq6d, x, self.in_features, self.out_features)
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)

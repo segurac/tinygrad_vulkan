@@ -7,9 +7,11 @@ from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 GGML_Q4_K = 12
 GGML_Q5_K = 13
 GGML_Q6_K = 14
+GGML_Q8_0 = 8
 _Q4K_BLOCK_SIZE, _Q4K_BLOCK_BYTES = 256, 144
 _Q5K_BLOCK_SIZE, _Q5K_BLOCK_BYTES = 256, 176
 _Q6K_BLOCK_SIZE, _Q6K_BLOCK_BYTES = 256, 210
+_Q80_BLOCK_SIZE, _Q80_BLOCK_BYTES = 32, 34
 
 @functools.cache
 def vulkan_q4k_enabled(device) -> bool:
@@ -34,7 +36,28 @@ def vulkan_ssmab_enabled(device) -> bool:
 def vulkan_quant_supported(device) -> bool:
   return vulkan_q4k_enabled(device) or vulkan_q5k_enabled(device) or vulkan_q6k_enabled(device)
 
-def _find_quant_bytes(weight: Tensor, ggml_type: int, block_size: int, block_bytes: int) -> Tensor|None:
+@functools.cache
+def vulkan_q80_qkv_enabled(device) -> bool:
+  # default ON: A/B on the APU showed r_64 (qkv Q8_0) 0.78 -> 0.38 ms/occ (32.3 -> 12.9 ms/step, tokens unchanged)
+  return str(device).startswith("VULKAN") and getenv("VULKAN_QKV", 1) != 0
+
+@functools.cache
+def vulkan_q80_dense_enabled(device) -> bool:
+  # default ON: A/B on the APU showed the dense Q8_0 shapes (ssm in/out proj, shared experts) net -10 ms/step
+  # (some fused epilogues split off as small elementwise kernels, still a net win)
+  return str(device).startswith("VULKAN") and getenv("VULKAN_Q80", 1) != 0
+
+@functools.cache
+def vulkan_q6k_dense_enabled(device) -> bool:
+  # default ON: A/B on the APU showed the Q6_K LM head 33.1 -> 10.1 ms/step (tokens unchanged)
+  return str(device).startswith("VULKAN") and getenv("VULKAN_LMHEAD", 1) != 0
+
+@functools.cache
+def vulkan_router_v2_enabled(device) -> bool:
+  # default ON: A/B on the APU showed the router tail (moe_selprob) 14.4 -> 3.9 ms/step for +40 CBTs
+  return str(device).startswith("VULKAN") and getenv("VULKAN_ROUTERV2", 1) != 0
+
+def _find_quant_bytes(weight: Tensor, ggml_type: int, block_size: int, block_bytes: int, align: int = 1) -> Tensor|None:
   # find the flat quantized byte buffer a dequantized weight reads from (zero-copy alias of the GGUF staging buffer)
   if not isinstance(n:=weight.numel(), int) or n % block_size: return None
   # note: detection is numel-based and shape-agnostic, so it also works for the 3-D (n_experts, out, in) routed-expert weights
@@ -47,7 +70,7 @@ def _find_quant_bytes(weight: Tensor, ggml_type: int, block_size: int, block_byt
       u = u.src[0]
     return u
   if unwrapped(weight.uop).key != unwrapped(ggml_data_to_tensor(Tensor(raw), n, ggml_type).uop).key: return None
-  if raw.contiguous_view_offset() is None or raw.buf_uop.dtype != dtypes.uint8: return None
+  if (off:=raw.contiguous_view_offset()) is None or off % align or raw.buf_uop.dtype != dtypes.uint8: return None
   return Tensor(raw).reshape(-1).contiguous()
 
 def find_q4k_bytes(weight: Tensor) -> Tensor|None:
@@ -58,6 +81,13 @@ def find_q5k_bytes(weight: Tensor) -> Tensor|None:
 
 def find_q6k_bytes(weight: Tensor) -> Tensor|None:
   return _find_quant_bytes(weight, GGML_Q6_K, _Q6K_BLOCK_SIZE, _Q6K_BLOCK_BYTES)
+
+def find_q80_bytes_a2(weight: Tensor) -> Tensor|None:
+  # even view offset required: the dense gemv reads u16 words composed from byte pairs
+  return _find_quant_bytes(weight, GGML_Q8_0, _Q80_BLOCK_SIZE, _Q80_BLOCK_BYTES, 2)
+
+def find_q6k_bytes_a2(weight: Tensor) -> Tensor|None:
+  return _find_quant_bytes(weight, GGML_Q6_K, _Q6K_BLOCK_SIZE, _Q6K_BLOCK_BYTES, 2)
 
 def find_q4k_expert_bytes(weight: Tensor) -> Tensor|None:
   # routed-expert (n_experts, out, in) Q4_K weight; the size check + dequant key match are numel-based, so reuse the dense detector
@@ -220,6 +250,82 @@ def vulkan_q6k_expert_linear(qweight: Tensor, sel: Tensor, x: Tensor, in_feature
   return res.reshape(*x.shape[:-2], k, out_features)
 
 @functools.cache
+def q80_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
+  # dense Q8_0 GEMV, decode. 34-byte block of 32 elems: d:2 (f16) q:32 (int8). One thread per 32-elem
+  # block, REDUCE b2 over the 16 two-elem u16 q-words; d is hoisted out of the reduce. u16 words are
+  # composed from byte pairs (block bases are 2-byte aligned, so is the buffer view).
+  groups = in_features // _Q80_BLOCK_SIZE
+  row16 = groups * (_Q80_BLOCK_BYTES // 2)
+  o = UOp.range(out_features, 0, AxisType.GLOBAL)
+  g = UOp.range(groups, 1, AxisType.LOCAL)
+  b2 = UOp.range(16, 2, AxisType.REDUCE)
+  wbase = o * row16 + g * (_Q80_BLOCK_BYTES // 2)
+  def U16(i): return (W8[i * 2].cast(dtypes.uint16) | W8[i * 2 + 1].cast(dtypes.uint16).lshift(8))
+  d = U16(wbase).bitcast(dtypes.float16).float()
+  q2 = U16(wbase + 1 + b2)
+  q0 = (q2 & 255).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  q1 = (q2 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  base = g * _Q80_BLOCK_SIZE + 2 * b2
+  term = d * q0 * x[base] + d * q1 * x[base + 1]
+  total = term.reduce(b2, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[o].store(total).end(o).sink(
+    arg=KernelInfo(name=f"q80_gemv_{out_features}_{in_features}", opts_to_apply=()))
+
+def vulkan_q80_linear(qweight: Tensor, x: Tensor, in_features: int, out_features: int) -> Tensor:
+  shape = x.shape
+  out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(q80_gemv_kernel, out_features=out_features, in_features=in_features)
+  res = Tensor.custom_kernel(out, qweight, x.reshape(in_features), fxn=fxn)[0]
+  return res.cast(x.dtype).reshape(*shape[:-1], out_features)
+
+@functools.cache
+def q6k_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
+  # dense Q6_K GEMV (the LM head), decode. 210-byte block of 256 elems: xl:128 xh:64 scales:16 d:2.
+  # Within a block, xl byte 64h+i (i<64) packs elems 128h+i (low) and 128h+64+i (high); the pair shares
+  # the xh byte 128+32h+i%32 (fields i//32 and i//32+2) and the block d. Thread (cb, h, s) =
+  # (g//8, (g%8)//4, (g%8)%4) owns elems {128h+16s+m, 128h+64+16s+m : m<16} (32 elems); REDUCE k over the
+  # 8 u16 words of xl bytes 64h+16s..64h+16s+15. Per word k the four elems are i=2k, 2k+64, 2k+1, 2k+65
+  # (scales 8h+s and 8h+s+4, both hoisted; d hoisted; all shifts LOCAL-constant).
+  blocks = in_features // _Q6K_BLOCK_SIZE
+  row16 = blocks * (_Q6K_BLOCK_BYTES // 2)
+  o = UOp.range(out_features, 0, AxisType.GLOBAL)
+  g = UOp.range(in_features // 32, 1, AxisType.LOCAL)
+  k = UOp.range(8, 2, AxisType.REDUCE)
+  cb, w8 = g // 8, g % 8
+  h, s = w8 // 4, w8 % 4
+  wbase = o * row16 + cb * (_Q6K_BLOCK_BYTES // 2)
+  def U16(i): return (W8[i * 2].cast(dtypes.uint16) | W8[i * 2 + 1].cast(dtypes.uint16).lshift(8))
+  d = U16(wbase + 104).bitcast(dtypes.float16).float()
+  even = (s & 1).eq(0)
+  sw1, sw2 = U16(wbase + 96 + 4 * h + s // 2), U16(wbase + 98 + 4 * h + s // 2)
+  sc1 = even.where(sw1 & 255, sw1 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  sc2 = even.where(sw2 & 255, sw2 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  sh = 2 * (s // 2)
+  xw = U16(wbase + 32 * h + 8 * s + k)
+  xh = U16(wbase + 64 + 16 * h + 8 * (s % 2) + k)
+  i1 = cb * _Q6K_BLOCK_SIZE + 128 * h + 16 * s + 2 * k
+  q0 = (xw & 15) + 16 * ((xh >> sh) & 3)                # elem i1
+  q1 = ((xw >> 4) & 15) + 16 * ((xh >> (sh + 4)) & 3)   # elem i1+64
+  q2 = ((xw >> 8) & 15) + 16 * ((xh >> (sh + 8)) & 3)   # elem i1+1
+  q3 = ((xw >> 12) & 15) + 16 * ((xh >> (sh + 12)) & 3) # elem i1+65
+  wd1 = d * sc1
+  wd2 = d * sc2
+  term = wd1 * (q0.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1] \
+       + wd2 * (q1.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1 + 64] \
+       + wd1 * (q2.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1 + 1] \
+       + wd2 * (q3.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1 + 65]
+  total = term.reduce(k, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[o].store(total).end(o).sink(
+    arg=KernelInfo(name=f"q6k_gemv_{out_features}_{in_features}", opts_to_apply=()))
+
+def vulkan_q6k_linear(qweight: Tensor, x: Tensor, in_features: int, out_features: int) -> Tensor:
+  shape = x.shape
+  out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(q6k_gemv_kernel, out_features=out_features, in_features=in_features)
+  res = Tensor.custom_kernel(out, qweight, x.reshape(in_features), fxn=fxn)[0]
+  return res.cast(x.dtype).reshape(*shape[:-1], out_features)
+
+@functools.cache
 def ssmab_kernel(out_a:UOp, out_b:UOp, x:UOp, wa:UOp, wb:UOp, bias:UOp, a:UOp, n_heads:int, dim:int) -> UOp:
   # fused SSM alpha/beta GEMV pair, decode (T=1): 2 kernels -> 1. All inputs are f16 buffers (post-attn_norm
   # x, realized HALF weights, ssm_a, ssm_dt.bias); product f16, accumulation f32, matmul output rounded to
@@ -297,6 +403,50 @@ def vulkan_moe_selprob(rank:Tensor, logits:Tensor, n_experts:int, k:int) -> tupl
   fxn = functools.partial(moe_selprob_kernel, E=n_experts, K=k)
   res = Tensor.custom_kernel(sel_out, probs_out, rank.reshape(n_experts), logits.reshape(n_experts), fxn=fxn)
   return res[0].reshape(B, T, k), res[1].reshape(B, T, k)
+
+@functools.cache
+def moe_sel_scatter_kernel(out_sel:UOp, out_s:UOp, rank:UOp, logits:UOp, E:int, K:int) -> UOp:
+  # parallel top-k scatter, decode: work item e keeps e iff its rank is in the top-K window. rank is a
+  # permutation of 0..E-1, so exactly the K winners each write their own slot (no races, no scans).
+  e = UOp.range(E, 0, AxisType.GLOBAL)
+  pos = rank[e] - (E - K)
+  ok = (pos >= 0) & (pos < K)
+  return UOp.group(
+    out_sel[pos.valid(ok)].store(e),
+    out_s[pos.valid(ok)].store(logits[e]),
+  ).end(e).sink(arg=KernelInfo(name=f"moe_sel_scatter_{E}_{K}", opts_to_apply=()))
+
+@functools.cache
+def moe_sel_softmax_kernel(out_probs:UOp, out_s:UOp, K:int) -> UOp:
+  # single work item softmax over the K gathered top-k logits; the op tree mirrors moe_selprob_kernel so
+  # the probs are bit-identical for the same inputs (the original zero-masked gather is exact value + 0s,
+  # equal to the direct read here).
+  m = UOp.range(1, 0, AxisType.GLOBAL)
+  ss = [out_s[mp] for mp in range(K)]
+  mx = ss[0]
+  for s in ss[1:]: mx = mx.maximum(s)
+  es = [((s + mx * -1.0) * 1.4426950408889634).exp2() for s in ss]
+  ssum = es[0]
+  for e in es[1:]: ssum = ssum + e
+  recip = ssum.reciprocal()
+  return UOp.group(*[out_probs[mp].store(es[mp] * recip) for mp in range(K)]).end(m).sink(
+    arg=KernelInfo(name=f"moe_sel_softmax_{K}", opts_to_apply=()))
+
+def vulkan_moe_selprob_v2(rank:Tensor, logits:Tensor, n_experts:int, k:int) -> tuple[Tensor, Tensor]|None:
+  # decode-only (B*T==1) MoE router tail, 2 kernels: the scatter (E work items, gated stores) replaces the
+  # single work item's 2*E-iter MAX/ADD scans; the softmax (1 work item) keeps the original op order. The
+  # softmax call takes the scatter's after-edge (res1[1]) so the JIT replay order is correct.
+  if not isinstance(n_experts, int) or n_experts <= 0 or not isinstance(k, int) or k <= 0: return None
+  if rank.shape != logits.shape or rank.shape[-1] != n_experts or prod(rank.shape[:-1]) != 1: return None
+  if rank.dtype is not dtypes.int32 or logits.dtype is not dtypes.float: return None
+  B, T = rank.shape[:-1]
+  sel_out = Tensor.empty(k, dtype=dtypes.int32, device=rank.device)
+  s_out = Tensor.empty(k, dtype=dtypes.float32, device=rank.device)
+  probs_out = Tensor.empty(k, dtype=dtypes.float32, device=rank.device)
+  res1 = Tensor.custom_kernel(sel_out, s_out, rank.reshape(n_experts), logits.reshape(n_experts),
+                              fxn=functools.partial(moe_sel_scatter_kernel, E=n_experts, K=k))
+  res2 = Tensor.custom_kernel(probs_out, res1[1], fxn=functools.partial(moe_sel_softmax_kernel, K=k))
+  return res1[0].reshape(B, T, k), res2[0].reshape(B, T, k)
 
 @functools.cache
 def vulkan_router_enabled(device) -> bool:
