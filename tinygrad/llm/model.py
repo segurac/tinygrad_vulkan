@@ -5,7 +5,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels import vulkan as _vulkan
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.helpers import prod
+from tinygrad.helpers import prod, Context
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -43,10 +43,18 @@ class ExpertWeights:
     self.num_experts, self.in_features, self.out_features = num_experts, in_features, out_features
     self._vq: Tensor|None = None
     self._vq5: Tensor|None = None
+    self._vq6: Tensor|None = None
+    self._vq6_checked = False
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     if resolve(prod(x.shape[:-2]) == 1) and _vulkan.vulkan_quant_supported(self.weight.device):
       # decode-only fused gather GEMV reading the quantized bytes directly (llama.cpp MoE kernel style)
+      if self.in_features == 512 and not self._vq6_checked and _vulkan.vulkan_q6k_enabled(self.weight.device):
+        self._vq6_checked = True
+        self._vq6 = _vulkan.find_q6k_bytes(self.weight)
+      if self._vq6 is not None:
+        ret = _vulkan.vulkan_q6k_expert_linear(self._vq6, sel, x, self.in_features, self.out_features, self.num_experts)
+        return ret + self.bias[sel] if hasattr(self, 'bias') else ret
       if self._vq5 is None and self.in_features == 512 and _vulkan.vulkan_q5k_enabled(self.weight.device):
         self._vq5 = _vulkan.find_q5k_bytes(self.weight)
       if self._vq5 is not None:
@@ -167,11 +175,26 @@ class FFNBlock:
       elif gating == ExpertGating.SIGMOID:        scores = logits.sigmoid()
       elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
 
-      _, sel = pairwise_topk(scores if bias is None else scores + bias, self.config.num_experts_per_tok)
-      probs = scores.gather(-1, sel)
-      # SOFTMAX_WEIGHT applies softmax after top-k selection
-      if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
-      if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
+      fused = None
+      n = logits.shape[-1]
+      k = self.config.num_experts_per_tok
+      if (gating == ExpertGating.SOFTMAX_WEIGHT and bias is None and not normalize_topk
+          and isinstance(n, int) and isinstance(k, int) and resolve(prod(x.shape[:-1]) == 1)
+          and _vulkan.vulkan_router_enabled(x.device)):
+        # decode (B*T==1) raw-logits fast path: keep the model's own gemv (logits) and rank kernels and
+        # fuse the sel-scatter + gather + softmax into one no-local-memory kernel (4 kernels -> 1)
+        idx = Tensor.arange(n).reshape(1, 1, n)
+        cmp = (logits.unsqueeze(-1) > logits.unsqueeze(-2)) | \
+              ((logits.unsqueeze(-1) == logits.unsqueeze(-2)) & (idx.unsqueeze(-1) < idx.unsqueeze(-2)))
+        fused = _vulkan.vulkan_moe_selprob(cmp.sum(axis=-1).cast('int32'), logits, n, k)
+      if fused is not None:
+        sel, probs = fused
+      else:
+        _, sel = pairwise_topk(scores if bias is None else scores + bias, k)
+        probs = scores.gather(-1, sel)
+        # SOFTMAX_WEIGHT applies softmax after top-k selection
+        if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
+        if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
       gate, up = self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)
       act = gated_activation(gate, up, alpha=self.config.swiglu_alpha, limit=self.config.swiglu_clamp_exp, up_bias=self.config.swiglu_up_bias)
@@ -335,6 +358,8 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+    self._ssmab_f16: tuple[Tensor, Tensor, Tensor, Tensor]|None = None
+    self._ssmconv_w16: Tensor|None = None
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     B, T, _ = x.shape
@@ -349,43 +374,89 @@ class GatedDeltaNetBlock(FFNBlock):
     x = x.half()
     out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
-    alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
-    log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
-                 self.ssm_a.reshape(self.num_v_heads, -1))
+    fused = None
+    if not symbolic and T == 1 and not is_kda and _vulkan.vulkan_ssmab_enabled(x.device):
+      # the HALF f16 view is a lazy cast over the raw GGUF byte buffer: a custom kernel consuming it would
+      # force a byte-wise materialization kernel every step unless the f16 buffers are realized once here
+      if self._ssmab_f16 is None:
+        # realize runs kernels: the @function context forbids device usage, re-allow it just for this
+        with Context(ALLOW_DEVICE_USAGE=1):
+          self._ssmab_f16 = (self.ssm_alpha.weight.realize(), self.ssm_beta.weight.realize(),
+                             self.ssm_dt["bias"].realize(), self.ssm_a.realize())
+      w16, b16, dt16, a16 = self._ssmab_f16
+      fused = _vulkan.vulkan_ssmab_alpha_beta(x, w16, b16, dt16, a16, self.num_v_heads)
+    if fused is not None:
+      log_alpha, beta = fused
+    else:
+      beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+      alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
+      log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
+                   self.ssm_a.reshape(self.num_v_heads, -1))
 
     # qkv conv, conv_state is reset when starting from position 0
-    conv_state = initial.where(0, self.conv_state)
-    # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
-    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
-    win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
-    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
-    conv_window = Tensor(win)
-    # the last conv_kernel-1 columns of the window become the next conv state
-    conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
-
-    conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
-    if symbolic:
-      out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
-      beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
-    q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
-            .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
-    v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
+    ssmconv = None
+    if not symbolic and T == 1 and not is_kda and _vulkan.vulkan_ssmconv_enabled(x.device):
+      # the conv1d weight is a lazy f16 cat over the GGUF file: pre-realize it once so the fused kernel
+      # reads a stable f16 buffer instead of forcing a per-step materialization
+      if self._ssmconv_w16 is None:
+        with Context(ALLOW_DEVICE_USAGE=1): self._ssmconv_w16 = self.ssm_conv1d["weight"].realize()
+      ssmconv = _vulkan.vulkan_ssmconv1d(self.attn_qkv(x), self.conv_state, self._ssmconv_w16, start_pos,
+                                          self.num_k_heads, self.num_v_heads, self.head_k_dim, self.conv_channels)
+    if ssmconv is not None:
+      # 4-tap conv + silu + q/k normalize denominator, plus an in-place conv_state shift kernel whose
+      # call uop is carried into the graph below as conv_state_store (the in-place write is otherwise
+      # invisible to the scheduler and the call would be dropped)
+      conv_out, den, conv_state_store = ssmconv
+      conv_out = conv_out.reshape(B, T, self.conv_channels)
+      q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
+      # den is the q/k heads' normalize denominators (the v heads are never normalized)
+      den = den.reshape(1, 1, 2 * self.num_k_heads, 1)
+      q = q.reshape(B, T, self.num_k_heads, self.head_k_dim) / den[:, :, :self.num_k_heads]
+      k = k.reshape(B, T, self.num_k_heads, self.head_k_dim) / den[:, :, self.num_k_heads:2*self.num_k_heads]
+      q, k = (z.repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
+      v = v.reshape(B, T, self.num_v_heads, self.head_v_dim)
+    else:
+      conv_state = initial.where(0, self.conv_state)
+      # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
+      # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
+      win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
+      win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
+      win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
+      conv_window = Tensor(win)
+      # the last conv_kernel-1 columns of the window become the next conv state
+      conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
+      conv_out = functools.reduce(lambda a,b: a+b,
+        (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
+      if symbolic:
+        out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
+        beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
+      q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
+      qk_eps = 1e-12 if is_kda else 1e-6
+      q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
+              .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
+      v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * self.head_k_dim**-0.5
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, V|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
-    state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
+    # carry the conv write into this graph (the fused conv path updates conv_state inside its kernel)
+    state = Tensor(self.recurrent_state.uop.after(conv_state_store) if conv_state_store is not None else self.recurrent_state.uop)
+    core = None
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
-    else:
+    elif ssmconv is not None and not symbolic and T == 1 and not is_kda and T_pad == 1 and _vulkan.vulkan_ssm_scan_enabled(x.device):
+      # 3-kernel fused decode scan (inner reduce, in-place recurrent-state update, out dot): replaces the
+      # generic 5-kernel scan (the in-place update removes the two full-state copy kernels). NOT bit-exact
+      # vs the generic path (f32 reduction-order reassociation in the 128-folds) -- env-gated, default OFF.
+      scan = _vulkan.vulkan_ssm_scan(conv_out, den.reshape(2 * self.num_k_heads), log_alpha, beta, state, start_pos,
+                                     self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+      if scan is not None:
+        core, _ = scan
+        core = core.reshape(B, T, self.num_v_heads, self.head_v_dim)
+    if core is None:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-1)
       state = initial.where(0, state.float())
