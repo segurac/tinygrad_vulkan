@@ -383,7 +383,7 @@ def vulkan_ssmconv1d(qkv:Tensor, conv_state:Tensor, w16:Tensor, sp:UOp,
   out_co = Tensor.empty(conv_channels, dtype=dtypes.float32, device=qkv.device)
   out_den = Tensor.empty(n_dh, dtype=dtypes.float32, device=qkv.device)
   st, q, w = conv_state.reshape(3 * conv_channels), qkv.reshape(conv_channels), w16.reshape(conv_channels * 4)
-  sp_ph = sp.src[0].replace(op=Ops.PARAM)  # the kernel-side form of the Variable (slot -1, name kept)
+  sp_ph = sp.unbound()  # the canonical Variable form (ALU PARAM, slot -1, name kept, no val payload)
   co_ph = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate((out_co.uop, st.uop, q.uop, w.uop)))
   co_call = ssmconv_co_kernel(*co_ph, sp_ph, n_htot=n_htot, head=head_k_dim, ch=conv_channels).call(
     out_co.uop, st.uop, q.uop, w.uop, sp)
@@ -472,7 +472,7 @@ def vulkan_ssm_scan(conv_out:Tensor, den:Tensor, log_alpha:Tensor, beta:Tensor, 
   # den/log_alpha/beta are consumed per-head (flat H/2HK vectors): accept any layout with the right numel
   # (the model transposes beta to (1, H, T) before this call)
   if den.numel() != 2 * HK or log_alpha.numel() != H or beta.numel() != H: return None
-  sp_ph = sp.src[0].replace(op=Ops.PARAM)
+  sp_ph = sp.unbound()
   # flat views: the kernels index 1-D placeholders (a scalar index into a multi-dim placeholder only
   # indexes dim 0); the call args are the same flat views (a RESHAPE on the buffer, like ssmconv's). The
   # state call arg carries the conv-shift after-edge; the c kernel's state arg additionally carries the
