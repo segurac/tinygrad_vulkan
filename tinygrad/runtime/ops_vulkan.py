@@ -60,6 +60,68 @@ def _warmup_vendors(rt) -> bool:
   if mode: return rt.vendor in {int(v, 0) for v in mode.split(",") if v.strip()}
   return rt.vendor == 0x10de
 
+def _arm_unit_diff(i, ra, rb) -> str:
+  # one line per differing unit of two consecutive steps: which program/bufs/grid/vals changed
+  if ra[0] != rb[0]:
+    return f"[{i}] kind A={ra[0]} B={rb[0]}: A={ra!r} B={rb!r}"
+  if ra[0] == "K":
+    parts = [f"[{i}] K prog#{ra[1]} {ra[2]}"]
+    if (ra[1], ra[2], ra[3]) != (rb[1], rb[2], rb[3]):
+      parts.append(f"program A=#{ra[1]}/{ra[2]} B=#{rb[1]}/{rb[2]}")
+    if ra[4] != rb[4]:
+      ch = [f"buf{j}: A={ra[4][j] if j < len(ra[4]) else '-'} B={rb[4][j] if j < len(rb[4]) else '-'}"
+            for j in range(max(len(ra[4]), len(rb[4])))
+            if j >= len(ra[4]) or j >= len(rb[4]) or ra[4][j] != rb[4][j]]
+      parts.append("bufs " + "; ".join(ch))
+    if ra[5] != rb[5]:
+      parts.append(f"grid A={ra[5]} B={rb[5]}")
+    if ra[7] != rb[7]:
+      ch = [f"{ra[6][k] if k < len(ra[6]) else k}: {ra[7][k]!r}->{rb[7][k]!r}"
+            for k in range(max(len(ra[7]), len(rb[7])))
+            if k >= len(ra[7]) or k >= len(rb[7]) or ra[7][k] != rb[7][k]]
+      parts.append("vals " + "; ".join(ch))
+    return " | ".join(parts)
+  return f"[{i}] {ra[0]}: A={ra[1:]} B={rb[1:]}"
+
+def _arm_report(dev) -> str:
+  # VK_ARMDIFF report: diff the last two recorded kernel steps (steady decode) and list every
+  # per-step-changing input; also flag any config launched >1x in one step with different vals
+  # (a UBO race hazard for the resubmit path) and the H2D/D2H buffer identities.
+  a, b = dev._arm_steps[-2], dev._arm_steps[-1]
+  out = [f"VK_ARMDIFF: {len(dev._arm_steps)} kernel steps recorded; diffing last two (steady decode)",
+         f"step A: {len(a)} units | step B: {len(b)} units"]
+  for tag, s in (("A", a), ("B", b)):
+    nk = sum(1 for r in s if r[0] == "K")
+    nh = sum(1 for r in s if r[0] == "H2D")
+    nd = sum(1 for r in s if r[0] == "D2H")
+    out.append(f"  {tag}: {nk} kernels, {nh} H2D, {nd} D2H")
+  if len(a) == len(b):
+    diffs = [(i, ra, rb) for i, (ra, rb) in enumerate(zip(a, b)) if ra != rb]
+    out.append(f"{len(diffs)}/{len(a)} units differ between consecutive steps:")
+    for i, ra, rb in diffs: out.append("  " + _arm_unit_diff(i, ra, rb))
+  else:
+    out.append(f"UNIT COUNT MISMATCH ({len(a)} vs {len(b)}):")
+    for i in range(max(len(a), len(b))):
+      ra = a[i] if i < len(a) else None
+      rb = b[i] if i < len(b) else None
+      if ra != rb: out.append(f"  [{i}] A={ra!r} B={rb!r}")
+  for tag, s in (("A", a), ("B", b)):
+    seen:dict[tuple, set] = {}
+    for r in s:
+      if r[0] == "K": seen.setdefault((r[1], r[3], r[4], len(r[7])), set()).add(r[7])
+    multi = {k: v for k, v in seen.items() if len(v) > 1}
+    if multi:
+      out.append(f"step {tag}: {len(multi)} config(s) launched >1x in-step with DIFFERENT vals (UBO race hazard):")
+      for (pid, nbufs, bufs, nvals), v in list(multi.items())[:5]:
+        b0 = bufs[0] if bufs else "-"
+        out.append(f"  prog#{pid} ({dev._arm_names.get(pid)}) nbufs={nbufs} nvals={nvals} bufs0={b0}: "
+                   f"{len(v)} distinct vals sets, e.g. {list(v)[:2]}")
+  for tag, s in (("A", a), ("B", b)):
+    for i, r in enumerate(s):
+      if r[0] in ("H2D", "D2H"):
+        out.append(f"step {tag} [{i}] {r[0]}: buf=0x{r[1]:x} off={r[2]} size={r[3]} | staging=0x{r[4]:x} size={r[5]} | bytes={r[6]}")
+  return "\n".join(out) + "\n"
+
 class VulkanAllocator(Allocator):
   # a few host-visible staging buffers, kept mapped, reused for every host<->device copy.
   # safe to reuse without per-buffer tracking: kernels accumulate in the pending command
@@ -102,17 +164,31 @@ class VulkanAllocator(Allocator):
   def _copyin(self, dest:VulkanBuffer, src:memoryview):
     # the LRU-reused dest may still be read/written by pending (unsubmitted) or in-flight
     # kernels; drain everything before reusing it
+    rt = self.dev.rt
+    t0 = rt._pt0()
+    if self.dev._arm:
+      self.dev._arm_step_done()  # a host->device copyin starts a new step (VK_ARMDIFF)
     self.dev.synchronize()
     st = self._staging(src.nbytes)
+    if self.dev._arm:
+      self.dev._arm_cur.append(("H2D", dest.vbuf.handle.value, dest.offset, dest.vbuf.size,
+                                st.handle.value, st.size, src.nbytes))
     _copy_to_arr(st.map(), src.cast('B'), src.nbytes)
     self.dev.rt.cmd_copy(dest.vbuf, st, src.nbytes, dst_off=dest.offset)
     self.dev.rt.submit()  # async H2D in its own cb; same-queue order places it before later kernels
+    rt._pt("copyin", t0)
   def _copyout(self, dest:memoryview, src:VulkanBuffer):
+    rt = self.dev.rt
+    t0 = rt._pt0()
     st = self._staging(dest.nbytes)
     # the D2H is recorded after any pending kernels in the current cb, so it runs after them
+    if self.dev._arm:
+      self.dev._arm_cur.append(("D2H", src.vbuf.handle.value, src.offset, src.vbuf.size,
+                                st.handle.value, st.size, dest.nbytes))
     self.dev.rt.cmd_copy(st, src.vbuf, dest.nbytes, src_off=src.offset)
     self.dev.rt.submit(wait=True)  # wait before the CPU reads staging
     _copy_to_mv(dest, st.map(), dest.nbytes)
+    rt._pt("copyout", t0)
   def _map(self, buf): raise RuntimeError("VULKAN cross-device map not supported")
 
 class VulkanProgram(Program['VulkanDevice']):
@@ -120,9 +196,16 @@ class VulkanProgram(Program['VulkanDevice']):
     self.dev, self.name, self.signature, self.lib = dev, obj.name, obj.signature, obj.lib
     self._cache:dict[tuple, tuple] = {}
     self._n = 0
+    # VK_REPLAY: per-signature template CBTs (rkey = (nbufs, nvals, bufs..., grid)), the
+    # rotation cursor for the VK_REPLAY_POOL templates, and the sighting count per rkey
+    self._tpl:dict[tuple, list] = {}
+    self._tpl_rr:dict[tuple, int] = {}
+    self._rkey_n:dict[tuple, int] = {}
+    self._arm_id = dev._arm_alloc(self) if dev._arm else -1
 
-  def _launch_cfg(self, bufs:tuple[VulkanBuffer, ...], nvals:int) -> tuple:
-    key = (len(bufs), nvals) + tuple((b.vbuf.handle.value, b.offset) for b in bufs)
+  def _launch_cfg(self, bufs:tuple[VulkanBuffer, ...], nvals:int, key:tuple|None=None) -> tuple:
+    if key is None:
+      key = (len(bufs), nvals) + tuple((b.vbuf.handle.value, b.offset) for b in bufs)
     if (cfg:=self._cache.get(key)) is not None: return cfg, False
     rt = self.dev.rt
     ubo = rt.buffer(8 * nvals, host_visible=True) if nvals else None
@@ -155,15 +238,22 @@ class VulkanProgram(Program['VulkanDevice']):
                vals:tuple[int|float, ...]=(), wait:bool=False, timeout:int|None=None) -> float|None:
     bufs = cast(tuple[VulkanBuffer, ...], bufs)
     nvals = len(vals)
-    (pipeline, dsl, ubo, ubo_map), is_new = self._launch_cfg(bufs, nvals)
+    rt = self.dev.rt
+    t0 = rt._pt0()
+    cfg_key = (len(bufs), nvals) + tuple((b.vbuf.handle.value, b.offset) for b in bufs)
+    (pipeline, dsl, ubo, ubo_map), is_new = self._launch_cfg(bufs, nvals, cfg_key)
     if nvals:
       var_dts = tuple(self.signature[len(bufs) + i][2] for i in range(nvals))
+      u0 = rt._pt0()
       ubo_map[:8 * nvals] = _pack_params(vals, var_dts)
-    if is_new and _warmup_vendors(self.dev.rt):
+      rt._pt("ubo", u0)
+    if self.dev._arm:
+      self.dev._arm_cur.append(("K", self._arm_id, self.name, len(bufs), cfg_key[2:], global_size,
+                                tuple(self.signature[len(bufs) + i][0] for i in range(nvals)), vals))
+    if is_new and _warmup_vendors(rt):
       # throwaway full-grid dispatch: primes the cold pipeline so the real launch below is
       # its second (the first loses stores on NV 550); must be the full grid -- a smaller
       # warmup grid does not prime it. Drained before the real dispatch.
-      rt = self.dev.rt
       rt.cmd_bind_pipeline(pipeline)
       rt.cmd_bind_descriptor_sets(pipeline, dsl.set)
       rt.cmd_dispatch(*global_size)
@@ -185,6 +275,35 @@ class VulkanProgram(Program['VulkanDevice']):
       # first so the measurement isolates this dispatch from the pending batch
       self.dev.rt.synchronize(timeout)
     st = time.perf_counter() if wait else 0
+    if not wait and rt._replay:
+      # pre-recorded resubmit: a repeat of this exact (program, bufs, nvals, grid) signature
+      # re-uses a recorded TEMPLATE CBT instead of re-recording bind/bdesc/dispatch. The UBO
+      # rewrite above already refreshed the per-step vals it reads at execute time, and the
+      # CBT's descriptor set still addresses the same buffer handles (VulkanAllocator never
+      # destroys VkBuffers -- _free is a no-op and the LRU reuses the same handle), so the
+      # recorded dispatch is still valid. The template flows through the same VK_STREAM
+      # chunked chained submits; replay_cb ends any active fresh unit first (pending order
+      # must stay == program order) and refuses a template whose previous resubmit is still
+      # pending/in-flight (a primary CBT may not be pending twice).
+      rkey = cfg_key + (global_size,)
+      n = self._rkey_n.get(rkey, 0)
+      self._rkey_n[rkey] = n + 1
+      if n:
+        tpls = self._tpl.setdefault(rkey, [])
+        # fill the rotating pool first (VK_REPLAY_POOL templates), then rotate through them.
+        # A template whose previous resubmit is still pending/in-flight refuses the resubmit
+        # (a primary CBT may not be pending twice) -- try the next pool slot, else fall
+        # through to a fresh record below (correct, slightly slower for that call).
+        if len(tpls) < rt._replay_pool:
+          cbt = rt.record_template(pipeline, dsl.set, global_size)
+          if cbt is not None: tpls.append(cbt)
+        for _ in range(len(tpls)):
+          i = self._tpl_rr.get(rkey, 0) % len(tpls)
+          self._tpl_rr[rkey] = i + 1
+          if rt.replay_cb(tpls[i]):
+            rt._repl[0] += 1
+            rt._pt("call", t0)
+            return None
     self.dev.rt.cmd_bind_pipeline(pipeline)
     self.dev.rt.cmd_bind_descriptor_sets(pipeline, dsl.set)
     self.dev.rt.cmd_dispatch(*global_size)
@@ -195,18 +314,48 @@ class VulkanProgram(Program['VulkanDevice']):
     if wait:
       # timeout (BEAM passes a per-candidate device timeout) is honored via the fence wait
       self.dev.rt.submit(wait=True, timeout_ms=timeout)
+      rt._pt("call", t0)
       return time.perf_counter() - st
+    rt._pt("call", t0)
     return None
 
 class VulkanDevice(Compiled):
   wait_timeout_ms = 30000
   def __init__(self, device:str=""):
     self.rt = vkrt.VkRt()
+    # VK_ARMDIFF=1 (default 0): record every VulkanProgram.__call__ (program id, buffer
+    # handles, grid, vals) and every H2D/D2H copy, one record-list per step (a step starts
+    # at an H2D copyin), and after 8 kernel steps diff the last two steady ones into
+    # /work/opencode/radv_batch/armdiff.txt to list exactly what changes per decode step.
+    self._arm = os.environ.get("VK_ARMDIFF", "0") == "1"
+    self._arm_dump_f = open("/tmp/opencode/radv_batch/armdump.jsonl", "w") if os.environ.get("VK_ARMDIFF_DUMP", "0") == "1" else None
+    self._arm_next = 0
+    self._arm_names:dict[int, str] = {}
+    self._arm_cur: list = []
+    self._arm_steps: list = []
     # VK_ARCH overrides the target arch (e.g. dump Adreno-keyed spv from a desktop box); the
     # arch selects the renderer/limits, independent of the physical device running the spv.
     arch = getenv("VK_ARCH", "") or ("radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
     self.max_buffer = getenv("VK_MAX_BUFFER", _VULKAN_MAX_BUFFER.get(arch) or 0) or None
     super().__init__(device, VulkanAllocator(self), [SPIRVRenderer], VulkanProgram, arch=arch)
+  def _arm_alloc(self, prg) -> int:
+    self._arm_next += 1
+    self._arm_names[self._arm_next] = prg.name
+    return self._arm_next
+  def _arm_step_done(self):
+    # an H2D copyin starts a new step: close the previous step's record. Keep only steps that
+    # ran kernels (weight-load copy bursts during model init don't count); after 8 steady
+    # kernel steps write the diff report and stop collecting.
+    if not self._arm_cur: return
+    cur, self._arm_cur = self._arm_cur, []
+    if not any(r[0] == "K" for r in cur): return
+    self._arm_steps.append(cur)
+    if self._arm_dump_f is not None:
+      import json as _json
+      self._arm_dump_f.write(_json.dumps(cur) + "\n")
+    if len(self._arm_steps) >= 8:
+      with open("/work/opencode/radv_batch/armdiff.txt", "w") as f: f.write(_arm_report(self))
+      self._arm = False
   def synchronize(self, timeout:int|None=None):
     # no timeline on this backend (work is not signaled into dev.timeline): flush the
     # pending command buffer, then wait on the submit ring's fences
