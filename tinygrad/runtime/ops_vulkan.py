@@ -166,6 +166,8 @@ class VulkanAllocator(Allocator):
     # kernels; drain everything before reusing it
     rt = self.dev.rt
     t0 = rt._pt0()
+    if (fd:=self.dev._fd) is not None:
+      fd._rec(("H2D", dest.vbuf, dest.offset, src.nbytes, bytes(src) if src.nbytes <= 64 else None))
     if self.dev._arm:
       self.dev._arm_step_done()  # a host->device copyin starts a new step (VK_ARMDIFF)
     self.dev.synchronize()
@@ -180,6 +182,8 @@ class VulkanAllocator(Allocator):
   def _copyout(self, dest:memoryview, src:VulkanBuffer):
     rt = self.dev.rt
     t0 = rt._pt0()
+    if (fd:=self.dev._fd) is not None:
+      fd._rec(("D2H", src.vbuf, src.offset, dest.nbytes))
     st = self._staging(dest.nbytes)
     # the D2H is recorded after any pending kernels in the current cb, so it runs after them
     if self.dev._arm:
@@ -240,6 +244,9 @@ class VulkanProgram(Program['VulkanDevice']):
     nvals = len(vals)
     rt = self.dev.rt
     t0 = rt._pt0()
+    if (fd:=self.dev._fd) is not None:
+      fd._rec(("K", self, bufs, global_size, vals,
+               tuple(self.signature[len(bufs) + i][2] for i in range(nvals))))
     cfg_key = (len(bufs), nvals) + tuple((b.vbuf.handle.value, b.offset) for b in bufs)
     (pipeline, dsl, ubo, ubo_map), is_new = self._launch_cfg(bufs, nvals, cfg_key)
     if nvals:
@@ -333,6 +340,7 @@ class VulkanDevice(Compiled):
     self._arm_names:dict[int, str] = {}
     self._arm_cur: list = []
     self._arm_steps: list = []
+    self._fd:VulkanFastDecode|None = None
     # VK_ARCH overrides the target arch (e.g. dump Adreno-keyed spv from a desktop box); the
     # arch selects the renderer/limits, independent of the physical device running the spv.
     arch = getenv("VK_ARCH", "") or ("radv" if self.rt.vendor == 0x1002 else f"vk{self.rt.vendor:04x}")
@@ -364,3 +372,108 @@ class VulkanDevice(Compiled):
     try: super().finalize()
     except RuntimeError as e: print(f"VULKAN synchronization failed before finalizing: {e}")
     self.rt.close()
+
+class VulkanFastDecode:
+  # VULKAN_FASTDECODE=1: re-drive a captured steady decode step (one generated token) without
+  # the framework (JIT replay / linear rewrite / schedule / program dispatch). The recipe is the
+  # captured step's kernel sequence (per-kernel pipeline + descriptor set + UBO) and its H2D/D2H
+  # staging, re-recorded fresh every step with the per-step (token, start_pos) update. The
+  # Step-1 stability audit (radv_batch/FASTDECODE.md) shows the steady step is deterministic
+  # except for the 4B token H2D payload, the single start_pos val in every val-kernel, and the
+  # start_pos+1 grid-x of the attention kernels; finish() validates exactly that and refuses to
+  # build a recipe for anything else (the caller then stays on the normal path).
+  def __init__(self, dev:VulkanDevice):
+    self.dev, self.rt = dev, dev.rt
+    self._cap: list = []
+    self._armed = False
+    self.ready = False
+    self.ops: list = []
+    self._d2h: tuple|None = None
+    self._progs: list = []   # keep the captured programs (and their cfg caches) alive
+    self.op_names: list[str] = []  # per-op label, parallel to self.ops (for TS profiling)
+    # private mapped staging: never LRU-reused, so a fast step needs no device drain. Each
+    # H2D gets its own 64B slice: the copies execute only after the whole step is recorded,
+    # so a shared slot would carry the last writer's bytes to every copy reading it (the
+    # normal path hides this with its per-copyin device drain; a fast step has none)
+    self._st_in = dev.rt.buffer(64 * 16, host_visible=True)
+    self._st_out = dev.rt.buffer(64, host_visible=True)
+    self._st_in_arr = self._st_in.map()
+    self._st_out_arr = self._st_out.map()
+  def arm(self):
+    if self._armed or self.ready: raise RuntimeError("VULKAN_FASTDECODE: double arm")
+    self._cap, self._armed = [], True
+  def _rec(self, rec):
+    if self._armed: self._cap.append(rec)
+  def finish(self, sp:int):
+    if not self._armed: raise RuntimeError("VULKAN_FASTDECODE: finish without arm")
+    self._armed = False
+    ks = [r for r in self._cap if r[0] == "K"]
+    h2ds = [r for r in self._cap if r[0] == "H2D"]
+    if not ks or not h2ds: raise RuntimeError(f"VULKAN_FASTDECODE: bad capture ({len(ks)}K {len(h2ds)}H2D)")
+    toks = [r for r in h2ds if r[3] == 4]
+    if len(toks) != 1: raise RuntimeError(f"VULKAN_FASTDECODE: expected one 4B token H2D, got {len(toks)}")
+    for r in h2ds:
+      if not (r[1].handle.value == toks[0][1].handle.value and r[2] == toks[0][2]) and r[4] is None:
+        raise RuntimeError(f"VULKAN_FASTDECODE: large H2D payload in the captured step ({r[3]}B)")
+    # the step may start with the previous step's input materialization (a D2H read of the
+    # argmax buffer before the token H2D): the fast path writes the token directly, so only
+    # the D2H after the token H2D (the out.item() read) is part of the recipe
+    i_tok = next(i for i, r in enumerate(self._cap) if r[0] == "H2D" and r[1].handle.value == toks[0][1].handle.value and r[2] == toks[0][2])
+    d2hs = [r for i, r in enumerate(self._cap) if r[0] == "D2H" and i > i_tok]
+    if len(d2hs) != 1: raise RuntimeError(f"VULKAN_FASTDECODE: expected one D2H after the token H2D, got {len(d2hs)}")
+    self._d2h = (d2hs[0][1], d2hs[0][2])
+    ops: list = []
+    self.op_names = []
+    h2d_slot = 0
+    for r in self._cap:
+      if r[0] == "K":
+        prog, bufs, grid, vals, var_dts = r[1], r[2], r[3], r[4], r[5]
+        if vals and any(v != sp for v in vals): raise RuntimeError(f"VULKAN_FASTDECODE: non-start_pos vals {vals} in {prog.name}")
+        if grid[0] == sp + 1 and "start_pos" not in prog.name:
+          raise RuntimeError(f"VULKAN_FASTDECODE: grid-x {sp + 1} on non-start_pos kernel {prog.name}")
+        (pipeline, dsl, ubo, ubo_map), _ = prog._launch_cfg(bufs, len(vals))
+        self._progs.append(prog)
+        ops.append(("K", pipeline, dsl.set, ubo_map, len(vals), var_dts, grid, grid[0] == sp + 1))
+        self.op_names.append(prog.name)
+      elif r[0] == "H2D":
+        if h2d_slot >= 16 or r[3] > 64: raise RuntimeError("VULKAN_FASTDECODE: too many/large H2D ops in the step")
+        is_tok = r[1].handle.value == toks[0][1].handle.value and r[2] == toks[0][2]
+        ops.append(("H2D", r[1], r[2], r[3], None if is_tok else r[4], is_tok, 64 * h2d_slot))
+        self.op_names.append("H2D_token" if is_tok else "H2D_seed")
+        h2d_slot += 1
+      # the single D2H is stored in self._d2h, not in the op list
+    self.ops = ops
+    self.ready = True
+  def step(self, token:int, sp:int) -> int:
+    # re-record the captured sequence with this step's (token, start_pos); the final
+    # submit(wait=True) fence covers the whole step (the VK_STREAM cross-submit semaphore
+    # chain orders the chunks, and the D2H is the last recorded command). Every H2D payload
+    # is written to its own staging slice up front: the copies execute only after recording
+    # continues, so a later host write to a shared slot would corrupt an earlier pending copy
+    rt = self.rt
+    assert self._d2h is not None
+    self.last_ts: list|None = None
+    ts = rt.ts_pool(len(self.ops) + 2) if getenv("VULKAN_FASTDECODE_TS") else None
+    for op in self.ops:
+      if op[0] != "H2D": continue
+      _, vbuf, off, nbytes, payload, is_tok, base = op
+      if is_tok: struct.pack_into("<i", self._st_in_arr, base, token)
+      else: self._st_in_arr[base:base + nbytes] = payload
+    if ts is not None: rt.ts_write(ts, 0)  # standalone first CBT: step start
+    for i, op in enumerate(self.ops):
+      if op[0] == "K":
+        _, pipeline, dset, ubo_map, nvals, var_dts, grid, sp_x = op
+        if nvals: ubo_map[:8 * nvals] = _pack_params((sp,) * nvals, var_dts)
+        rt.cmd_bind_pipeline(pipeline)
+        rt.cmd_bind_descriptor_sets(pipeline, dset)
+        rt.cmd_dispatch(sp + 1 if sp_x else grid[0], grid[1], grid[2])
+      else:
+        _, vbuf, off, nbytes, payload, is_tok, base = op
+        rt.cmd_copy(vbuf, self._st_in, nbytes, dst_off=off, src_off=base)
+      if ts is not None: rt.ts_write(ts, i + 1)
+    d2h_vbuf, d2h_off = self._d2h
+    rt.cmd_copy(self._st_out, d2h_vbuf, 4, src_off=d2h_off)
+    if ts is not None: rt.ts_write(ts, len(self.ops) + 1)
+    rt.submit(wait=True)
+    if ts is not None: self.last_ts = rt.ts_read(ts, len(self.ops) + 2)
+    return struct.unpack_from("<i", self._st_out_arr, 0)[0]

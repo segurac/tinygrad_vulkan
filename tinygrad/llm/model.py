@@ -616,8 +616,24 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
+  def _fastdecode(self, temperature:float):
+    # VULKAN_FASTDECODE=1: re-drive the steady single-token decode step from a captured
+    # kernel recipe instead of replaying the JIT (VulkanFastDecode in runtime/ops_vulkan.py).
+    # The recipe is captured on this call's first steady decode step and validated for the
+    # shape invariants of that step (temp 0 argmax output, single start_pos val); None = normal path.
+    if getenv("VULKAN_FASTDECODE", "0") != "1" or temperature != 0.0: return None
+    if not str(self.token_embd.weight.device).startswith("VULKAN"): return None
+    from tinygrad.device import Device
+    from tinygrad.runtime import ops_vulkan
+    dev = Device[str(self.token_embd.weight.device)]
+    if not isinstance(dev, ops_vulkan.VulkanDevice): return None
+    fd = ops_vulkan.VulkanFastDecode(dev)
+    dev._fd = fd
+    return fd
+
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    fd = self._fastdecode(temperature)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -630,6 +646,24 @@ class Transformer:
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      if fd is not None and out is not None and start_pos >= prompt_len:
+        # steady single-token decode: re-drive the captured recipe (the first steady step
+        # runs the normal path once with the capture armed to build it)
+        if not fd.ready:
+          fd.arm()
+          out = self(out, sp, temp).realize()
+          tokens.append(int(out.item()))
+          try: fd.finish(start_pos)
+          except Exception: fd = None  # recipe invariants not met: stay on the normal path
+          start_pos += n_toks
+          self._cached_tokens = tokens[:-1]
+          yield tokens[-1]
+          continue
+        tokens.append(fd.step(tokens[-1], start_pos))
+        start_pos += n_toks
+        self._cached_tokens = tokens[:-1]
+        yield tokens[-1]
+        continue
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed

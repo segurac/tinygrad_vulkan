@@ -85,6 +85,9 @@ VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x800
 VK_ACCESS_SHADER_READ_BIT = 0x2000
 VK_ACCESS_SHADER_WRITE_BIT = 0x4000
+VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT = 0x10
+VK_QUERY_TYPE_TIMESTAMP = 2
+VK_QUERY_RESULT_64_BIT_BIT = 2
 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6
 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7
 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC = 8
@@ -112,6 +115,7 @@ ST_COMMAND_POOL_CREATE_INFO = 39
 ST_COMMAND_BUFFER_ALLOCATE_INFO = 40
 ST_COMMAND_BUFFER_BEGIN_INFO = 42
 ST_MEMORY_BARRIER = 10
+ST_QUERY_POOL_CREATE_INFO = 24
 
 # ---------------------------------------------------------------- structs --
 
@@ -168,6 +172,10 @@ class VkBufferCopy(C.Structure):
 class VkMemoryBarrier(C.Structure):
     _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("srcAccessMask", c_uint32),
                 ("dstAccessMask", c_uint32)]
+
+class VkQueryPoolCreateInfo(C.Structure):
+    _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("flags", c_uint32),
+                ("queryType", c_uint32), ("queryCount", c_uint32), ("pipelineStatisticsCount", c_uint32)]
 
 class VkShaderModuleCreateInfo(C.Structure):
     _fields_ = [("sType", c_uint32), ("pNext", c_void_p), ("flags", c_uint32),
@@ -310,6 +318,9 @@ vkCreateDescriptorPool = _vk("vkCreateDescriptorPool", _v + _v + _v + [C.POINTER
 vkDestroyDescriptorPool = _vk("vkDestroyDescriptorPool", _v + _v + _v, _N)
 vkAllocateDescriptorSets = _vk("vkAllocateDescriptorSets", _v + _v + [C.POINTER(c_void_p)])
 vkUpdateDescriptorSets = _vk("vkUpdateDescriptorSets", _v + [c_uint32] + 2 * _v, _N)
+vkCreateQueryPool = _vk("vkCreateQueryPool", _v + _v + _v + [C.POINTER(c_void_p)])
+vkCmdWriteTimestamp = _vk("vkCmdWriteTimestamp", _v + [c_uint32] + _v + [c_uint32], _N)
+vkGetQueryPoolResults = _vk("vkGetQueryPoolResults", _v + _v + [c_uint32, c_uint32] + [c_size_t] + _v + [c_size_t] + [c_uint32])
 
 class VkError(RuntimeError):
     def __init__(self, op, result):
@@ -642,6 +653,26 @@ class VkRt:
         vkDestroyBuffer(self.device, vbuf.handle, None)
         vkFreeMemory(self.device, vbuf.mem, None)
         self._buffers.remove(vbuf)
+
+    # -- GPU timestamps (diagnostic): one timestamp query per recorded command boundary --
+
+    def ts_pool(self, n:int):
+        qi = VkQueryPoolCreateInfo(sType=ST_QUERY_POOL_CREATE_INFO, queryType=VK_QUERY_TYPE_TIMESTAMP,
+                                   queryCount=n)
+        pool = c_void_p()
+        _check("vkCreateQueryPool", vkCreateQueryPool(self.device, C.byref(qi), None, C.byref(pool)))
+        return pool
+    def ts_write(self, pool, i:int):
+        # record timestamp i at BOTTOM_OF_PIPE of the active CBT (after every command recorded
+        # in it so far); starts a fresh CBT when none is active -- the caller submits it like any
+        # other unit. Read with ts_read only after the covering fence has signaled.
+        if not self._cb_active: self._begin_cmd()
+        vkCmdWriteTimestamp(self.cbs[self._slot], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, i)
+    def ts_read(self, pool, n:int) -> list:
+        out = (c_uint64 * n)()
+        _check("vkGetQueryPoolResults", vkGetQueryPoolResults(self.device, pool, 0, n, n * 8, out, 8,
+                                                              VK_QUERY_RESULT_64_BIT_BIT))
+        return list(out)
 
     # -- shaders / pipelines / descriptors --
 
