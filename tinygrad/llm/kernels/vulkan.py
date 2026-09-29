@@ -57,6 +57,15 @@ def vulkan_router_v2_enabled(device) -> bool:
   # default ON: A/B on the APU showed the router tail (moe_selprob) 14.4 -> 3.9 ms/step for +40 CBTs
   return str(device).startswith("VULKAN") and getenv("VULKAN_ROUTERV2", 1) != 0
 
+@functools.cache
+def vulkan_gemv4_enabled(device) -> bool:
+  # default ON: A/B on the APU showed the multi-row wave64 GEMV shapes (llama.cpp GCN class) net -23 ms/step
+  # (GPU 131 -> 107 ms/step, tokens bit-exact): 4 rows/workgroup for the K-quant in=512 experts and the Q8_0
+  # in<=512 shapes (16 -> 64 threads), 2 rows for Q4_K experts and the Q8_0/Q6_K in=2048 shapes (64 -> 128).
+  # The 256-thread rows=4 Q4_K shape A/B'd worse than rows=2, and Q8_0 in=4096 keeps its original shape.
+  # The per-row reduce order matches the single-row kernels, so outputs are bit-exact with them.
+  return str(device).startswith("VULKAN") and getenv("VULKAN_GEMV4", 1) != 0
+
 def _find_quant_bytes(weight: Tensor, ggml_type: int, block_size: int, block_bytes: int, align: int = 1) -> Tensor|None:
   # find the flat quantized byte buffer a dequantized weight reads from (zero-copy alias of the GGUF staging buffer)
   if not isinstance(n:=weight.numel(), int) or n % block_size: return None
@@ -158,7 +167,11 @@ def vulkan_q4k_expert_linear(qweight: Tensor, sel: Tensor, x: Tensor, in_feature
   # decode-only (B*T==1) routed-expert GEMV: x (B, T, 1, in), sel (B, T, k) int32 -> out (B, T, k, out_features)
   k = sel.shape[-1]
   out = Tensor.empty(k, out_features, dtype=x.dtype, device=x.device)
-  fxn = functools.partial(q4k_moe_gemv_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts)
+  if vulkan_gemv4_enabled(x.device) and out_features % 2 == 0:
+    # A/B on the APU: 128-thread WGs (rows=2) beat both the 64-thread single-row and the 256-thread rows=4 shapes
+    fxn = functools.partial(q4k_moe_gemv4_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts, rows=2)
+  else:
+    fxn = functools.partial(q4k_moe_gemv_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts)
   res = Tensor.custom_kernel(out, qweight, x.reshape(in_features), sel, fxn=fxn)[0]
   return res.reshape(*x.shape[:-2], k, out_features)
 
@@ -200,7 +213,10 @@ def vulkan_q5k_expert_linear(qweight: Tensor, sel: Tensor, x: Tensor, in_feature
   # -> out (B, T, k, out_features); x row e feeds expert slot e (the model always passes the k-row activation)
   k = sel.shape[-1]
   out = Tensor.empty(k, out_features, dtype=x.dtype, device=x.device)
-  fxn = functools.partial(q5k_moe_gemv_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts)
+  if vulkan_gemv4_enabled(x.device) and out_features % 4 == 0:
+    fxn = functools.partial(q5k_moe_gemv4_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts, rows=4)
+  else:
+    fxn = functools.partial(q5k_moe_gemv_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts)
   res = Tensor.custom_kernel(out, qweight, x.reshape(k * in_features), sel, fxn=fxn)[0]
   return res.reshape(*x.shape[:-2], k, out_features)
 
@@ -245,9 +261,111 @@ def vulkan_q6k_expert_linear(qweight: Tensor, sel: Tensor, x: Tensor, in_feature
   # -> out (B, T, k, out_features); x row e feeds expert slot e (the model always passes the k-row activation)
   k = sel.shape[-1]
   out = Tensor.empty(k, out_features, dtype=x.dtype, device=x.device)
-  fxn = functools.partial(q6k_moe_gemv_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts)
+  if vulkan_gemv4_enabled(x.device) and out_features % 4 == 0:
+    fxn = functools.partial(q6k_moe_gemv4_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts, rows=4)
+  else:
+    fxn = functools.partial(q6k_moe_gemv_kernel, out_features=out_features, in_features=in_features, n_experts=n_experts)
   res = Tensor.custom_kernel(out, qweight, x.reshape(k * in_features), sel, fxn=fxn)[0]
   return res.reshape(*x.shape[:-2], k, out_features)
+
+@functools.cache
+def q4k_moe_gemv4_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_features:int, n_experts:int, rows:int) -> UOp:
+  # wave64 multi-row gather GEMV (llama.cpp mul_mat_vec_q4_k, GCN class): `rows` output rows per workgroup,
+  # one (r, g) thread per (row, 32-elem group). The b=REDUCE(32) loop and the per-row g-reduce keep the
+  # single-row kernel's exact per-row reduction order, so the result is bit-exact with q4k_moe_gemv_kernel.
+  # The x load x[g*32+b] is r-invariant (shared across the rows of the workgroup); the workgroup-local
+  # buffer holds the rows x groups partials and the reduce is over g only (r is its upstream local).
+  k = sel.shape[-1]
+  groups = in_features // 32
+  row_bytes = (in_features // _Q4K_BLOCK_SIZE) * _Q4K_BLOCK_BYTES
+  expert_bytes = out_features * row_bytes
+  o = UOp.range(k * out_features // rows, 0, AxisType.GLOBAL)
+  e, rg = o // (out_features // rows), o % (out_features // rows)
+  expert = sel[0, 0, e]                # one int32 read per workgroup, constant inside the reduce loops
+  r = UOp.range(rows, 1, AxisType.LOCAL)
+  g = UOp.range(groups, 2, AxisType.LOCAL)     # one thread per 32-elem group
+  b = UOp.range(32, 3, AxisType.REDUCE)        # 32 elems/group, one per byte
+  row = rg * rows + r
+  block, sg = g // 8, g % 8
+  bbase = expert * expert_bytes + row * row_bytes + block * _Q4K_BLOCK_BYTES
+  def B(k): return W8[bbase + k]
+  d    = ((B(0).cast(dtypes.uint16) | B(1).cast(dtypes.uint16).lshift(8))).bitcast(dtypes.float16).float()
+  dmin = ((B(2).cast(dtypes.uint16) | B(3).cast(dtypes.uint16).lshift(8))).bitcast(dtypes.float16).float()
+  sglt4 = (sg < 4)
+  sc = sglt4.where(B(4 + sg) & 63, (B(8 + sg) & 15) | ((B(sg) >> 6).lshift(4)))
+  mn = sglt4.where(B(8 + sg) & 63, (B(8 + sg) >> 4) | ((B(4 + sg) >> 6).lshift(4)))
+  ds, dm = d * sc.float(), dmin * mn.float()
+  sg_even = (sg & 1).eq(0)
+  wbyte = W8[bbase + 16 + (sg // 2) * 32 + b]
+  q = sg_even.where(wbyte & 15, (wbyte >> 4) & 15)
+  term = (ds * q.float() - dm) * x[g * 32 + b]
+  total = term.reduce(b, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[e, row].store(total.cast(out.dtype)).end(o, r).sink(
+    arg=KernelInfo(name=f"q4k_moe_gemv4_{out_features}_{in_features}_{n_experts}", opts_to_apply=()))
+
+@functools.cache
+def q5k_moe_gemv4_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_features:int, n_experts:int, rows:int) -> UOp:
+  # wave64 multi-row gather GEMV, Q5_K dequant (ggml_type 13); see q5k_moe_gemv_kernel for the layout.
+  # x is the flat (k, in) per-expert activation rows; expert slot e uses row e (r-invariant).
+  k = sel.shape[-1]
+  groups = in_features // 32
+  row_bytes = (in_features // _Q5K_BLOCK_SIZE) * _Q5K_BLOCK_BYTES
+  expert_bytes = out_features * row_bytes
+  o = UOp.range(k * out_features // rows, 0, AxisType.GLOBAL)
+  e, rg = o // (out_features // rows), o % (out_features // rows)
+  expert = sel[0, 0, e]
+  r = UOp.range(rows, 1, AxisType.LOCAL)
+  g = UOp.range(groups, 2, AxisType.LOCAL)
+  b = UOp.range(32, 3, AxisType.REDUCE)
+  row = rg * rows + r
+  block, sg = g // 8, g % 8
+  bbase = expert * expert_bytes + row * row_bytes + block * _Q5K_BLOCK_BYTES
+  def B(k): return W8[bbase + k]
+  d    = ((B(0).cast(dtypes.uint16) | B(1).cast(dtypes.uint16).lshift(8))).bitcast(dtypes.float16).float()
+  dmin = ((B(2).cast(dtypes.uint16) | B(3).cast(dtypes.uint16).lshift(8))).bitcast(dtypes.float16).float()
+  sglt4 = (sg < 4)
+  sc = sglt4.where(B(4 + sg) & 63, (B(8 + sg) & 15) | ((B(sg) >> 6).lshift(4)))
+  mn = sglt4.where(B(8 + sg) & 63, (B(8 + sg) >> 4) | ((B(4 + sg) >> 6).lshift(4)))
+  ds, dm = d * sc.float(), dmin * mn.float()
+  sg_even = (sg & 1).eq(0)
+  wbyte = W8[bbase + 48 + (sg // 2) * 32 + b]
+  q = sg_even.where(wbyte & 15, (wbyte >> 4) & 15)
+  q = q + (16 * ((W8[bbase + 16 + b] >> sg) & 1))   # qh top bit; sg is LOCAL, so the shift is constant in the REDUCE loop
+  term = (ds * q.float() - dm) * x[e * in_features + g * 32 + b]
+  total = term.reduce(b, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[e, row].store(total.cast(out.dtype)).end(o, r).sink(
+    arg=KernelInfo(name=f"q5k_moe_gemv4_{out_features}_{in_features}_{n_experts}", opts_to_apply=()))
+
+@functools.cache
+def q6k_moe_gemv4_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_features:int, n_experts:int, rows:int) -> UOp:
+  # wave64 multi-row gather GEMV, Q6_K dequant (ggml_type 14); see q6k_moe_gemv_kernel for the layout.
+  k = sel.shape[-1]
+  row_bytes = (in_features // _Q6K_BLOCK_SIZE) * _Q6K_BLOCK_BYTES
+  expert_bytes = out_features * row_bytes
+  o = UOp.range(k * out_features // rows, 0, AxisType.GLOBAL)
+  e, rg = o // (out_features // rows), o % (out_features // rows)
+  expert = sel[0, 0, e]
+  r = UOp.range(rows, 1, AxisType.LOCAL)
+  g = UOp.range(16, 2, AxisType.LOCAL)          # 16 threads x 32 elems/thread = 512
+  b = UOp.range(8, 3, AxisType.REDUCE)          # (block, half, quartet)
+  row = rg * rows + r
+  cb, h, q = b // 4, (b // 2) % 2, b % 2
+  i = g + 16 * q
+  bbase = expert * expert_bytes + row * row_bytes
+  wbase = bbase + cb * _Q6K_BLOCK_BYTES
+  d = ((W8[wbase + 208].cast(dtypes.uint16) | W8[wbase + 209].cast(dtypes.uint16).lshift(8))).bitcast(dtypes.float16).float()
+  xl1 = W8[wbase + h * 64 + i]            # elems i (low) and i+64 (high)
+  xl2 = W8[wbase + h * 64 + 32 + i]       # elems i+32 (low) and i+96 (high)
+  xh1 = W8[wbase + 128 + h * 32 + i]      # fields 0..3 of elems i, i+32, i+64, i+96
+  base = e * in_features + cb * _Q6K_BLOCK_SIZE + h * 128 + i
+  def term(j, qx, xh_shifted):
+    w = d * ((qx + 16 * xh_shifted).cast(dtypes.int32) - 32).cast(dtypes.float32)
+    return (w * W8[wbase + 192 + 8 * h + q + 2 * j].bitcast(dtypes.int8).float()) * x[base + 32 * j]
+  total = (term(0, xl1 & 15, xh1 & 3) + term(1, xl2 & 15, (xh1 >> 2) & 3)
+          + term(2, (xl1 >> 4) & 15, (xh1 >> 4) & 3) + term(3, (xl2 >> 4) & 15, (xh1 >> 6) & 3))
+  total = total.reduce(b, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[e, row].store(total.cast(out.dtype)).end(o, r).sink(
+    arg=KernelInfo(name=f"q6k_moe_gemv4_{out_features}_{in_features}_{n_experts}", opts_to_apply=()))
 
 @functools.cache
 def q80_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
@@ -271,10 +389,39 @@ def q80_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -
   return out[o].store(total).end(o).sink(
     arg=KernelInfo(name=f"q80_gemv_{out_features}_{in_features}", opts_to_apply=()))
 
+@functools.cache
+def q80_gemv4_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int, rows:int) -> UOp:
+  # wave64 multi-row Q8_0 GEMV (llama.cpp mul_mat_vec_q8_0, NUM_ROWS class): `rows` output rows per
+  # workgroup, one (r, g) thread per (row, 32-elem block). Per-row reduction order matches q80_gemv_kernel,
+  # so the result is bit-exact with it. x is the shared single decode row (r-invariant).
+  groups = in_features // _Q80_BLOCK_SIZE
+  row16 = groups * (_Q80_BLOCK_BYTES // 2)
+  o = UOp.range(out_features // rows, 0, AxisType.GLOBAL)
+  r = UOp.range(rows, 1, AxisType.LOCAL)
+  g = UOp.range(groups, 2, AxisType.LOCAL)
+  b2 = UOp.range(16, 3, AxisType.REDUCE)
+  row = o * rows + r
+  wbase = row * row16 + g * (_Q80_BLOCK_BYTES // 2)
+  def U16(i): return (W8[i * 2].cast(dtypes.uint16) | W8[i * 2 + 1].cast(dtypes.uint16).lshift(8))
+  d = U16(wbase).bitcast(dtypes.float16).float()
+  q2 = U16(wbase + 1 + b2)
+  q0 = (q2 & 255).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  q1 = (q2 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  base = g * _Q80_BLOCK_SIZE + 2 * b2
+  term = d * q0 * x[base] + d * q1 * x[base + 1]
+  total = term.reduce(b2, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[row].store(total).end(o, r).sink(
+    arg=KernelInfo(name=f"q80_gemv4_{out_features}_{in_features}", opts_to_apply=()))
+
 def vulkan_q80_linear(qweight: Tensor, x: Tensor, in_features: int, out_features: int) -> Tensor:
   shape = x.shape
   out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(q80_gemv_kernel, out_features=out_features, in_features=in_features)
+  if (rows := (4 if in_features <= 512 else 2)) > 1 and in_features < 4096 \
+     and vulkan_gemv4_enabled(x.device) and out_features % rows == 0:
+    # A/B on the APU: 64/128-thread WGs win for in<=2048; the 256-thread in=4096 shape is slower than the original
+    fxn = functools.partial(q80_gemv4_kernel, out_features=out_features, in_features=in_features, rows=rows)
+  else:
+    fxn = functools.partial(q80_gemv_kernel, out_features=out_features, in_features=in_features)
   res = Tensor.custom_kernel(out, qweight, x.reshape(in_features), fxn=fxn)[0]
   return res.cast(x.dtype).reshape(*shape[:-1], out_features)
 
@@ -318,10 +465,51 @@ def q6k_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -
   return out[o].store(total).end(o).sink(
     arg=KernelInfo(name=f"q6k_gemv_{out_features}_{in_features}", opts_to_apply=()))
 
+@functools.cache
+def q6k_gemv4_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int, rows:int) -> UOp:
+  # wave64 multi-row Q6_K GEMV (the LM head), `rows` output rows per workgroup; see q6k_gemv_kernel for the
+  # layout. Per-row reduction order matches it, so the result is bit-exact with it.
+  blocks = in_features // _Q6K_BLOCK_SIZE
+  row16 = blocks * (_Q6K_BLOCK_BYTES // 2)
+  o = UOp.range(out_features // rows, 0, AxisType.GLOBAL)
+  r = UOp.range(rows, 1, AxisType.LOCAL)
+  g = UOp.range(in_features // 32, 2, AxisType.LOCAL)
+  k = UOp.range(8, 3, AxisType.REDUCE)
+  row = o * rows + r
+  cb, w8 = g // 8, g % 8
+  h, s = w8 // 4, w8 % 4
+  wbase = row * row16 + cb * (_Q6K_BLOCK_BYTES // 2)
+  def U16(i): return (W8[i * 2].cast(dtypes.uint16) | W8[i * 2 + 1].cast(dtypes.uint16).lshift(8))
+  d = U16(wbase + 104).bitcast(dtypes.float16).float()
+  even = (s & 1).eq(0)
+  sw1, sw2 = U16(wbase + 96 + 4 * h + s // 2), U16(wbase + 98 + 4 * h + s // 2)
+  sc1 = even.where(sw1 & 255, sw1 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  sc2 = even.where(sw2 & 255, sw2 >> 8).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+  sh = 2 * (s // 2)
+  xw = U16(wbase + 32 * h + 8 * s + k)
+  xh = U16(wbase + 64 + 16 * h + 8 * (s % 2) + k)
+  i1 = cb * _Q6K_BLOCK_SIZE + 128 * h + 16 * s + 2 * k
+  q0 = (xw & 15) + 16 * ((xh >> sh) & 3)                # elem i1
+  q1 = ((xw >> 4) & 15) + 16 * ((xh >> (sh + 4)) & 3)   # elem i1+64
+  q2 = ((xw >> 8) & 15) + 16 * ((xh >> (sh + 8)) & 3)   # elem i1+1
+  q3 = ((xw >> 12) & 15) + 16 * ((xh >> (sh + 12)) & 3) # elem i1+65
+  wd1 = d * sc1
+  wd2 = d * sc2
+  term = wd1 * (q0.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1] \
+       + wd2 * (q1.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1 + 64] \
+       + wd1 * (q2.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1 + 1] \
+       + wd2 * (q3.cast(dtypes.int32) - 32).cast(dtypes.float32) * x[i1 + 65]
+  total = term.reduce(k, arg=Ops.ADD).reduce(g, arg=Ops.ADD)
+  return out[row].store(total).end(o, r).sink(
+    arg=KernelInfo(name=f"q6k_gemv4_{out_features}_{in_features}", opts_to_apply=()))
+
 def vulkan_q6k_linear(qweight: Tensor, x: Tensor, in_features: int, out_features: int) -> Tensor:
   shape = x.shape
   out = Tensor.empty(out_features, dtype=dtypes.float32, device=x.device)
-  fxn = functools.partial(q6k_gemv_kernel, out_features=out_features, in_features=in_features)
+  if vulkan_gemv4_enabled(x.device) and out_features % 2 == 0:
+    fxn = functools.partial(q6k_gemv4_kernel, out_features=out_features, in_features=in_features, rows=2)
+  else:
+    fxn = functools.partial(q6k_gemv_kernel, out_features=out_features, in_features=in_features)
   res = Tensor.custom_kernel(out, qweight, x.reshape(in_features), fxn=fxn)[0]
   return res.cast(x.dtype).reshape(*shape[:-1], out_features)
 
