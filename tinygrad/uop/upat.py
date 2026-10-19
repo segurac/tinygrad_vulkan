@@ -38,10 +38,6 @@ def _get_clause(self:UPat, base:UOp, depth=0) -> UOp:
     else:
       and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=self.match_dtype[0])),
                             arg=("{0}.dtype is {1}", dtypes.void)))
-  if self.match_tag is not None:
-    if len(self.match_tag) > 1:
-      and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=frozenset(self.match_tag))), arg=("{0}.tag in {1}", dtypes.void)))
-    else: and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=self.match_tag[0])), arg=("{0}.tag == {1}", dtypes.void)))
   if self.src is not None:
     # single match
     if len(self.src) == 1 and isinstance(self.src[0], tuple):
@@ -130,8 +126,8 @@ pm_renderer = PatternMatcher([
   (UPat(Ops.OR, src=UPat(Ops.CUSTOMI), name="x"), lambda x: UOp(Ops.CUSTOMI, arg=("(" + ' or '.join(y.arg[0] for y in x.src) + ")", dtypes.void))),
 
   (UPat(Ops.CUSTOM, src=UPat(Ops.CUSTOMI), name="x"), lambda x: UOp(Ops.CUSTOMI, arg=(x.arg[0].format(*[y.arg[0] for y in x.src]), dtypes.void))),
-  (UPat(Ops.INDEX, src=(UPat(Ops.CUSTOMI, name="x"), UPat(Ops.CONST, name="c")), name="g"),
-   lambda x,c,g: x.replace(arg=(x.arg[0]+f".src[{c.val}]", dtypes.void)))
+  (UPat(Ops.INDEX, src=(UPat(Ops.CUSTOMI, name="x"), UPat(Ops.CONST, name="c"))),
+   lambda x,c: x.replace(arg=(x.arg[0]+f".src[{c.val}]", dtypes.void)))
 ], compiled=False)
 
 def _final_render(x:UOp, has_ctx:bool, depth=1) -> list[str]:

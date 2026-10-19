@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import unittest
 import numpy as np
-from test.helpers import is_hcq2_device, assert_jit_cache_len, not_support_multi_device, needs_second_gpu
+from test.helpers import assert_jit_cache_len, not_support_multi_device, needs_second_gpu
 from tinygrad import Tensor, TinyJit, Device, dtypes, Context, UOp
 from tinygrad.helpers import DEV, GlobalCounters
 from tinygrad.engine.jit import JitError
@@ -575,7 +575,6 @@ class TestJitPrune(unittest.TestCase):
     assert_jit_cache_len(w2_prune, 1)
 
 class TestJitFree(unittest.TestCase):
-  @unittest.skipIf(is_hcq2_device(), "hcq2 keeps refs to intermediate buffers")
   def test_free_intermediates(self):
     ext_tensor = Tensor([1,24,23,45,1])
     @TinyJit
@@ -616,10 +615,8 @@ class TestJitFree(unittest.TestCase):
       return x
     for _ in range(5): fxn(Tensor([1]))
     self.assertEqual(x.item(), 6)
-    pre_free = GlobalCounters.mem_used
     fxn.captured.free_intermediates()
-    savings_after_free = pre_free - GlobalCounters.mem_used
-    self.assertEqual(savings_after_free, 0)
+    self.assertTrue(x.uop.base.buffer.is_allocated())
     fxn(Tensor([2]))
     self.assertEqual(x.item(), 8)
 

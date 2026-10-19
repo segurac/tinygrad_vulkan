@@ -130,7 +130,7 @@ class VulkanAllocator(Allocator):
   # its D2H after the pending kernels and waits on its fence before the CPU reads.
   STAGING_MAX = 4
   def __init__(self, dev:Compiled):
-    super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
+    super().__init__(dev)
     self._staging_bufs:list = []
   def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
     # check before the base alloc, whose error wrapper would re-raise this as a bare MemoryError

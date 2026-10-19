@@ -78,7 +78,8 @@ class TestDType(unittest.TestCase):
 
   def test_const_kernel(self):
     if not get_available_cast_dtypes(self.DTYPE): raise unittest.SkipTest("dtype does not run here")
-    _assert_eq(Tensor.ones((4,4), dtype=self.DTYPE).clone(), self.DTYPE, np.ones((4,4)))
+    for value in ([1, 1e-5] if dtypes.is_float(self.DTYPE) else [1]):
+      _assert_eq(Tensor.full((4,4), value, dtype=self.DTYPE).clone(), self.DTYPE, np.full((4,4), truncate[self.DTYPE](value)))
 
   def test_same_size_ops(self):
     for dtype in get_available_cast_dtypes(self.DTYPE):
@@ -122,6 +123,17 @@ def _test_ops(a_dtype:DType, b_dtype:DType, target_dtype=None):
   _assert_eq(Tensor([[1,2],[3,4]], dtype=a_dtype)@Tensor.eye(2, dtype=b_dtype), target_dtype, [[1,2],[3,4]])
 
 class TestFp8sConversions(unittest.TestCase):
+  def test_native_fp8_conversions(self):
+    for dt in (d for d in dtypes.fp8s if d in supported_dtypes):
+      with self.subTest(dtype=dt):
+        values = np.array([fp8_to_float(x, dt) for x in range(256)], dtype=np.float32)
+        np.testing.assert_equal(Tensor(np.arange(256, dtype=np.uint8)).bitcast(dt).float().numpy(), values)
+        finite = np.unique(values[np.isfinite(values)])
+        midpoints = (finite[:-1] + finite[1:]) / 2
+        samples = np.concatenate((finite, [-0.0], midpoints, np.nextafter(midpoints, -np.inf), np.nextafter(midpoints, np.inf))).astype(np.float32)
+        expected = np.array([float_to_fp8(float(x), dt) for x in samples], dtype=np.uint8)
+        np.testing.assert_equal(Tensor(samples).cast(dt).bitcast(dtypes.uint8).numpy(), expected)
+
   def test_min_max_representable(self):
     # e4m3 and the fnuz fp8s have no inf, so their extremes (the MAX/MIN reduce identities) are finite values that round trip
     for dt in dtypes.fp8s: self.assertEqual(Tensor([dt.min, dt.max], dtype=dt).float().tolist(), [dt.min, dt.max])
@@ -196,6 +208,8 @@ class TestBFloat16DType(unittest.TestCase):
     t.realize()
     back = t.cast(dtypes.float32)
     assert tuple(back.numpy().tolist()) == (9984., -1, -1000, -9984, 20)
+
+  def test_bf16_floor(self): self.assertEqual(Tensor([-1.5, 2.5], dtype=dtypes.bfloat16).floor().tolist(), [-2., 2.])
 
 class TestBFloat16DTypeCast(unittest.TestCase):
   def test_f16_to_bf16_conversion(self):
