@@ -4,6 +4,7 @@ from typing import Any, cast
 from tinygrad.device import Compiled, Allocator, BufferStorage, BufferSpec, MMIOInterface, Program, TinyELF
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import getenv, mv_address
+from tinygrad.uop.ops import AddrSpace
 from tinygrad.renderer.nir import SPIRVRenderer
 from tinygrad.runtime.support import vulkan_rt as vkrt
 
@@ -198,6 +199,11 @@ class VulkanAllocator(Allocator):
 class VulkanProgram(Program['VulkanDevice']):
   def __init__(self, dev:VulkanDevice, obj:TinyELF):
     self.dev, self.name, self.signature, self.lib = dev, obj.name, obj.signature, obj.lib
+    # the call args are slot-ordered and interleave buffers with bound scalars; the signature's addrspace splits them.
+    # precompute the split + the scalar dtypes/names (params load scalars from the UBO compactly, in slot order).
+    self._is_buf = tuple(s[1] is not AddrSpace.ALU for s in self.signature)
+    self._var_dts = tuple(s[2] for s in self.signature if s[1] is AddrSpace.ALU)
+    self._var_names = tuple(s[0] for s in self.signature if s[1] is AddrSpace.ALU)
     self._cache:dict[tuple, tuple] = {}
     self._n = 0
     # VK_REPLAY: per-signature template CBTs (rkey = (nbufs, nvals, bufs..., grid)), the
@@ -238,25 +244,24 @@ class VulkanProgram(Program['VulkanDevice']):
       try: rt.destroy_cfg(pipeline, dsl, ubo)
       except Exception: pass
 
-  def __call__(self, *bufs:int|Any, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
-               vals:tuple[int|float, ...]=(), wait:bool=False, timeout:int|None=None) -> float|None:
-    bufs = cast(tuple[VulkanBuffer, ...], bufs)
+  def __call__(self, *args:int|Any, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
+               wait:bool=False, timeout:int|None=None) -> float|None:
+    assert len(args) == len(self._is_buf), f"VULKAN {self.name}: {len(args)} args vs {len(self._is_buf)} signature params"
+    bufs = cast(tuple[VulkanBuffer, ...], tuple(a for a,b in zip(args, self._is_buf) if b))
+    vals = tuple(a for a,b in zip(args, self._is_buf) if not b)
     nvals = len(vals)
     rt = self.dev.rt
     t0 = rt._pt0()
     if (fd:=self.dev._fd) is not None:
-      fd._rec(("K", self, bufs, global_size, vals,
-               tuple(self.signature[len(bufs) + i][2] for i in range(nvals))))
+      fd._rec(("K", self, bufs, global_size, vals, self._var_dts))
     cfg_key = (len(bufs), nvals) + tuple((b.vbuf.handle.value, b.offset) for b in bufs)
     (pipeline, dsl, ubo, ubo_map), is_new = self._launch_cfg(bufs, nvals, cfg_key)
     if nvals:
-      var_dts = tuple(self.signature[len(bufs) + i][2] for i in range(nvals))
       u0 = rt._pt0()
-      ubo_map[:8 * nvals] = _pack_params(vals, var_dts)
+      ubo_map[:8 * nvals] = _pack_params(vals, self._var_dts)
       rt._pt("ubo", u0)
     if self.dev._arm:
-      self.dev._arm_cur.append(("K", self._arm_id, self.name, len(bufs), cfg_key[2:], global_size,
-                                tuple(self.signature[len(bufs) + i][0] for i in range(nvals)), vals))
+      self.dev._arm_cur.append(("K", self._arm_id, self.name, len(bufs), cfg_key[2:], global_size, self._var_names, vals))
     if is_new and _warmup_vendors(rt):
       # throwaway full-grid dispatch: primes the cold pipeline so the real launch below is
       # its second (the first loses stores on NV 550); must be the full grid -- a smaller

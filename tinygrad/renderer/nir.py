@@ -492,6 +492,11 @@ class SPIRVRenderer(LVPRenderer):
     alu_params = [u for u in uops if u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU]
     self.ubo_var = self._bo_var(self.b, mesa.nir_var_mem_ubo, dtypes.ulong, len(alu_params), b"params", 0) if alu_params else None
     self.buf_vars: dict[UOp, Any] = {}
-    for u in (u for u in uops if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU):
-      self.buf_vars[u] = self._bo_var(self.b, mesa.nir_var_mem_ssbo, u.dtype, u.max_numel(),
-        f"buf{len(self.buf_vars)}".encode(), 1+len(self.buf_vars))
+    nbuf = 0
+    for u in uops:
+      if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU:
+        self.buf_vars[u] = self._bo_var(self.b, mesa.nir_var_mem_ssbo, u.dtype, u.max_numel(),
+          f"buf{nbuf}".encode(), 1+nbuf); nbuf += 1
+      elif u.op is Ops.AFTER and u.src[0] in self.buf_vars:
+        # the new AST shadows stored buffers through AFTER; loads/stores index the shadow, alias it to the param
+        self.buf_vars[u] = self.buf_vars[u.src[0]]
