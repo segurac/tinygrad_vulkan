@@ -108,7 +108,7 @@ def q4k_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -
   row_bytes = (in_features // _Q4K_BLOCK_SIZE) * _Q4K_BLOCK_BYTES
   o = UOp.range(out_features, 0, AxisType.GLOBAL)
   g = UOp.range(groups, 1, AxisType.LOCAL)     # one thread per 32-elem group
-  b = UOp.range(32, 2, AxisType.REDUCE)        # 32 elems/group, one per byte
+  b = UOp.range(32, 2, AxisType.WEAK)        # 32 elems/group, one per byte
   block, sg = g // 8, g % 8
   bbase = o * row_bytes + block * _Q4K_BLOCK_BYTES
   def B(k): return W8[bbase + k]
@@ -145,7 +145,7 @@ def q4k_moe_gemv_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_fe
   e, row = o // out_features, o % out_features
   expert = sel[0, 0, e]                # one int32 read per work item, constant inside the reduce loops
   g = UOp.range(groups, 1, AxisType.LOCAL)     # one thread per 32-elem group
-  b = UOp.range(32, 2, AxisType.REDUCE)        # 32 elems/group, one per byte
+  b = UOp.range(32, 2, AxisType.WEAK)        # 32 elems/group, one per byte
   block, sg = g // 8, g % 8
   bbase = expert * expert_bytes + row * row_bytes + block * _Q4K_BLOCK_BYTES
   def B(k): return W8[bbase + k]
@@ -189,7 +189,7 @@ def q5k_moe_gemv_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_fe
   e, row = o // out_features, o % out_features
   expert = sel[0, 0, e]                # one int32 read per work item, constant inside the reduce loops
   g = UOp.range(groups, 1, AxisType.LOCAL)     # one thread per 32-elem group
-  b = UOp.range(32, 2, AxisType.REDUCE)        # 32 elems/group, one per byte
+  b = UOp.range(32, 2, AxisType.WEAK)        # 32 elems/group, one per byte
   block, sg = g // 8, g % 8
   bbase = expert * expert_bytes + row * row_bytes + block * _Q5K_BLOCK_BYTES
   def B(k): return W8[bbase + k]
@@ -237,7 +237,7 @@ def q6k_moe_gemv_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_fe
   expert = sel[0, 0, e]                # one int32 read per work item, constant inside the reduce loop
   bbase = expert * expert_bytes + row * row_bytes
   g = UOp.range(16, 1, AxisType.LOCAL)          # 16 threads x 32 elems/thread = 512
-  b = UOp.range(8, 2, AxisType.REDUCE)          # (block, half, quartet)
+  b = UOp.range(8, 2, AxisType.WEAK)          # (block, half, quartet)
   cb, h, q = b // 4, (b // 2) % 2, b % 2
   i = g + 16 * q
   wbase = bbase + cb * _Q6K_BLOCK_BYTES
@@ -376,7 +376,7 @@ def q80_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -
   row16 = groups * (_Q80_BLOCK_BYTES // 2)
   o = UOp.range(out_features, 0, AxisType.GLOBAL)
   g = UOp.range(groups, 1, AxisType.LOCAL)
-  b2 = UOp.range(16, 2, AxisType.REDUCE)
+  b2 = UOp.range(16, 2, AxisType.WEAK)
   wbase = o * row16 + g * (_Q80_BLOCK_BYTES // 2)
   def U16(i): return (W8[i * 2].cast(dtypes.uint16) | W8[i * 2 + 1].cast(dtypes.uint16).lshift(8))
   d = U16(wbase).bitcast(dtypes.float16).float()
@@ -437,7 +437,7 @@ def q6k_gemv_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int) -
   row16 = blocks * (_Q6K_BLOCK_BYTES // 2)
   o = UOp.range(out_features, 0, AxisType.GLOBAL)
   g = UOp.range(in_features // 32, 1, AxisType.LOCAL)
-  k = UOp.range(8, 2, AxisType.REDUCE)
+  k = UOp.range(8, 2, AxisType.WEAK)
   cb, w8 = g // 8, g % 8
   h, s = w8 // 4, w8 % 4
   wbase = o * row16 + cb * (_Q6K_BLOCK_BYTES // 2)
@@ -521,7 +521,7 @@ def ssmab_kernel(out_a:UOp, out_b:UOp, x:UOp, wa:UOp, wb:UOp, bias:UOp, a:UOp, n
   # sigmoid in f16. The two dot products share one local reduction over a 2-element stack: two separate
   # reduce(t) reductions would bufferize to the same shared array and the second scan would read the first's data
   t = UOp.range(16, 1, AxisType.LOCAL)
-  r = UOp.range(128, 2, AxisType.REDUCE)
+  r = UOp.range(128, 2, AxisType.WEAK)
   o = UOp.range(n_heads, 0, AxisType.GLOBAL)
   k = t * 128 + r
   xh = x[k]
@@ -563,7 +563,7 @@ def moe_selprob_kernel(out_sel:UOp, out_probs:UOp, rank:UOp, logits:UOp, E:int, 
   m = UOp.range(1, 0, AxisType.GLOBAL)
   sels, ss, ax = [], [], 1
   for mp in range(K):
-    u1, u2 = UOp.range(E, ax, AxisType.REDUCE), UOp.range(E, ax+1, AxisType.REDUCE)
+    u1, u2 = UOp.range(E, ax, AxisType.WEAK), UOp.range(E, ax+1, AxisType.WEAK)
     ax += 2
     sels.append(rank[u1].eq(E - K + mp).where(u1.cast(dtypes.int32), -1).reduce(u1, arg=Ops.MAX))
     ss.append(rank[u2].eq(E - K + mp).where(logits[u2], 0.0).reduce(u2, arg=Ops.ADD))
@@ -676,7 +676,7 @@ def ssmconv_den_kernel(out_den:UOp, co:UOp, n_dh:int, head:int) -> UOp:
   # result is bit-exact with the generic path; the v heads are never normalized, so only 2*n_k_heads
   # denominators exist.
   h = UOp.range(n_dh, 0, AxisType.GLOBAL)
-  rr = UOp.range(head, 1, AxisType.REDUCE)
+  rr = UOp.range(head, 1, AxisType.WEAK)
   v = co[h * head + rr]
   return UOp.group(out_den[h].store((v * v).reduce(rr, arg=Ops.ADD).sqrt().maximum(1e-6))).end(h).sink(
     arg=KernelInfo(name=f"ssmconv_den_{n_dh}_{head}", opts_to_apply=()))
@@ -751,7 +751,7 @@ def ssmscan_a_kernel(vmin:UOp, state:UOp, qkv:UOp, den:UOp, log_alpha:UOp, sp:UO
   # row when sp==0 (reset).
   h = UOp.range(H, 0, AxisType.GLOBAL)
   v = UOp.range(V, 1, AxisType.GLOBAL)
-  k = UOp.range(K, 2, AxisType.REDUCE)
+  k = UOp.range(K, 2, AxisType.WEAK)
   st = sp.ne(0).where(state[(h * V + v) * K + k], 0.0)
   alpha = (log_alpha[h] * 1.4426950408889634).exp2()
   kn = qkv[(h % HK) * K + k + HK * K] * den[(h % HK) + HK].reciprocal()
@@ -783,7 +783,7 @@ def ssmscan_c_kernel(core:UOp, state:UOp, qkv:UOp, den:UOp, H:int, HK:int, K:int
   # core = REDUCE_k ((qraw*1/den_q)*state')*K**-0.5.
   h = UOp.range(H, 0, AxisType.GLOBAL)
   v = UOp.range(V, 1, AxisType.GLOBAL)
-  k = UOp.range(K, 2, AxisType.REDUCE)
+  k = UOp.range(K, 2, AxisType.WEAK)
   qn = qkv[(h % HK) * K + k] * den[h % HK].reciprocal()
   return UOp.group(core[h * V + v].store(((qn * state[h * V * K + v * K + k]) * (K ** -0.5)).reduce(k, arg=Ops.ADD))).end(
     h, v).sink(arg=KernelInfo(name=f"ssmscan_c_{H}_{V}_{K}", opts_to_apply=()))

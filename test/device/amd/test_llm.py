@@ -3,9 +3,8 @@ from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.llm.kernels.amd import (Linear, amd_custom_kernels_supported, q8_quantize, flash_attention, gated_delta_prefill,
-                                      QUANT_SIZES, HALFWORD_QUANTS, _wmma_rdna4)
+                                      QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, _wmma_rdna4)
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.helpers import Context, DEV, OSX
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
 class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
@@ -59,6 +58,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_q4_k_linear(self): self._test_quant_linear(12, 144)
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
+  def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))
   def test_q3_k_linear(self): self._test_quant_linear(11, 110, in_features=768, token_counts=(1, 3, 16))
@@ -85,11 +85,9 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     scales = np.array([0, 2**-24, -2**-24, 2**-14, -0.00035, .001, .0037, -.125, 1, -4, 8], np.float16)
     identity = Tensor(np.eye(768, dtype=np.float16)).realize()
     for typ, size in QUANT_SIZES.items():
-      # TODO: z3 cannot model the integer ORs in IQ3_S/IQ2_S lookup indices.
-      # Compile locally so the CHECK_OOB override also applies to compilation.
-      with self.subTest(ggml_type=typ), Context(**({"CHECK_OOB": 0, "PARALLEL": 0} if typ in (21, 22) else {})):
+      with self.subTest(ggml_type=typ):
         packed = rng.integers(0, 256, (48*3, size), dtype=np.uint8)
-        blocks = packed.reshape(-1, 18) if typ == 20 else packed
+        blocks = packed.reshape(-1, SMALL_BLOCK_QUANTS[typ]*2) if typ in SMALL_BLOCK_QUANTS else packed
         offset = size-2 if typ in (11, 14) else 80 if typ == 10 else 0
         blocks[:, offset:offset+2] = np.resize(scales, len(blocks)).view(np.uint8).reshape(-1, 2)
         if typ in (10, 12, 13):
@@ -305,7 +303,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     out = flash_attention(q, assigned, 1).realize()
     np.testing.assert_allclose(out.numpy(), v.expand(1, 2, 1, 32).numpy(), rtol=2e-2, atol=2e-2)
 
-  @unittest.skipIf(OSX and DEV.interface.startswith("MOCK"), "TODO: incorrect results in the macOS AMD emulator")
   def test_flash_attention_decode_symbolic_gqa(self):
     with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected custom decode")):
       self._test_flash_decode(8, 2, 256, 128, 37, symbolic=True)
@@ -313,7 +310,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_flash_attention_decode_gqa_tail(self): self._test_flash_decode(3, 1, 192, 64, 37)
 
   def test_flash_attention_decode_gqa_output_layout(self): self._test_flash_decode(4, 1, 128, 256, 3)
-  @unittest.skipIf(OSX and DEV.interface.startswith("MOCK"), "TODO: incorrect results in the macOS AMD emulator")
   def test_flash_attention_decode_large_gqa_group(self): self._test_flash_decode(8, 1, 256, 256, 73)
 
   def _test_flash_decode(self, heads, kv_heads, dim, n, valid, symbolic=False):

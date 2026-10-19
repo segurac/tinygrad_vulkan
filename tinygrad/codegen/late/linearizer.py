@@ -9,12 +9,12 @@ def linearize(sink:UOp) -> list[UOp]:
   # this is a toposort with priority
   lst = list(sink.toposort())
   out_degree:defaultdict[UOp, int] = defaultdict(int)
-  priorities:dict[UOp, tuple[int, int, Any]] = {}
+  priorities:dict[UOp, tuple[int, int, int, Any]] = {}
 
   # get consumers and assign priorities
   # NOTE: this requires the lst be locally toposorted
   for u in reversed(lst):
-    for s in u.src: out_degree[s] += 1
+    for s in u.src_without_body: out_degree[s] += 1
 
     # we place UOps with higher run_counts later
     run_count = prod([int(r.vmax)+1 for r in u.ranges])
@@ -30,7 +30,7 @@ def linearize(sink:UOp) -> list[UOp]:
       case Ops.RANGE: priority = 5    # placing RANGE is good
       case Ops.END | Ops.BACKEDGE: priority = -5     # placing loop exits is bad
       case _: priority = 0            # everything else has priority 0
-    priorities[u] = (run_count, priority, extra)
+    priorities[u] = (run_count, len(u.ranges), priority, extra)
 
   # number the uops in "ideal" order
   nkey = {u:i for i,u in enumerate(sorted(lst, key=lambda x: priorities[x]+(x.tuplize if TUPLE_ORDER else ())))}
@@ -40,7 +40,7 @@ def linearize(sink:UOp) -> list[UOp]:
   newlst = []
   while heap:
     newlst.append(u:=heapq.heappop(heap)[1])
-    for v in u.src:
+    for v in u.src_without_body:
       out_degree[v] -= 1
       if out_degree[v] == 0: heapq.heappush(heap, (-nkey[v],v))
   newlst = newlst[::-1]
@@ -62,7 +62,7 @@ class CFGContext:
     for u in sink.toposort():
       # get the deps from the src
       deps[u] = {}
-      for s in u.src: deps[u] |= deps[s]
+      for s in u.src_without_body: deps[u] |= deps[s]
 
       if u.op in (Ops.END, Ops.BACKEDGE, Ops.SINK):
         nesting |= {x:u for x in deps[u] if x.op in (Ops.END, Ops.BACKEDGE) and (u.op is Ops.SINK or u.src[1] in deps[x]) and x not in nesting}
@@ -81,7 +81,8 @@ class CFGContext:
         self.edges[y.src[1]] = x
 
 pm_add_control_flow = PatternMatcher([
-  (UPat(Ops.RANGE, name="x"), lambda ctx,x: x.replace(src=x.src+(y,)) if (y:=ctx.edges.get(x)) is not None else None),
+  # the ordering dep goes on the bound wrapped in AFTER, so a RANGE always has exactly one src
+  (UPat(Ops.RANGE, name="x"), lambda ctx,x: x.replace(src=(x.src[0].after(y),)) if (y:=ctx.edges.get(x)) is not None else None),
 ])
 
 def do_split_ends(e:UOp):

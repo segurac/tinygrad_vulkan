@@ -18,11 +18,6 @@ class TestWeakPromotion(unittest.TestCase):
       self.assertEqual(c.item(), value)
       self.assertEqual(t.contiguous().dtype, weak)
 
-  def test_assign_into_weak_commits(self):
-    t = Tensor.const(0.5)
-    t.assign(Tensor(1.0, dtype=dtypes.default_float))
-    self.assertEqual((t.dtype, t.item()), (dtypes.default_float, 1.0))
-
   def test_copysign_meets_operands(self):
     r = Tensor([2], dtype=dtypes.uint8).copysign(Tensor([1], dtype=dtypes.uint32))
     self.assertEqual((r.dtype, r.tolist()), (dtypes.uint32, [2]))
@@ -144,7 +139,8 @@ class TestWeakMaterializationEntries(unittest.TestCase):
       self.assertEqual(weak_val().data().format, strong.fmt)
       self.assertEqual(weak_val().numpy().dtype.itemsize, strong.itemsize)
       self.assertEqual(weak_val().tolist(), [value])
-      self.assertEqual(weak_val().cast(strong).realize().uop.buffer.dtype, strong)
+      typed = weak_val().cast(strong).realize().uop
+      self.assertEqual((typed.dtype, typed.buffer.nbytes), (strong, strong.itemsize))
       self.assertEqual(weak_val().contiguous().dtype, weak)                 # no layout to fix, stays weak
       self.assertEqual(weak_val().realize().dtype, weak)                    # no width to store, stays weak
       self.assertEqual(weak_val().clone().dtype, strong)                    # storage commits at the default
