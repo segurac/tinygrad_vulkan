@@ -495,8 +495,8 @@ class SPIRVRenderer(LVPRenderer):
     nbuf = 0
     for u in uops:
       if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU:
-        self.buf_vars[u] = self._bo_var(self.b, mesa.nir_var_mem_ssbo, u.dtype, u.max_numel(),
-          f"buf{nbuf}".encode(), 1+nbuf); nbuf += 1
+        self.buf_vars[u] = self._bo_var(self.b, mesa.nir_var_mem_ssbo, u.dtype, u.max_numel(), f"buf{nbuf}".encode(), 1+nbuf)
+        nbuf += 1
       elif u.op is Ops.AFTER and u.src[0] in self.buf_vars:
         # the new AST shadows stored buffers through AFTER; loads/stores index the shadow, alias it to the param
         self.buf_vars[u] = self.buf_vars[u.src[0]]
