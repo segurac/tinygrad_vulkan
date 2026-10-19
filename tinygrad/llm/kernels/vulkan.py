@@ -284,7 +284,7 @@ def q4k_moe_gemv4_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_f
   expert = sel[0, 0, e]                # one int32 read per workgroup, constant inside the reduce loops
   r = UOp.range(rows, 1, AxisType.LOCAL)
   g = UOp.range(groups, 2, AxisType.LOCAL)     # one thread per 32-elem group
-  b = UOp.range(32, 3, AxisType.REDUCE)        # 32 elems/group, one per byte
+  b = UOp.range(32, 3, AxisType.WEAK)        # 32 elems/group, one per byte
   row = rg * rows + r
   block, sg = g // 8, g % 8
   bbase = expert * expert_bytes + row * row_bytes + block * _Q4K_BLOCK_BYTES
@@ -316,7 +316,7 @@ def q5k_moe_gemv4_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_f
   expert = sel[0, 0, e]
   r = UOp.range(rows, 1, AxisType.LOCAL)
   g = UOp.range(groups, 2, AxisType.LOCAL)
-  b = UOp.range(32, 3, AxisType.REDUCE)
+  b = UOp.range(32, 3, AxisType.WEAK)
   row = rg * rows + r
   block, sg = g // 8, g % 8
   bbase = expert * expert_bytes + row * row_bytes + block * _Q5K_BLOCK_BYTES
@@ -347,7 +347,7 @@ def q6k_moe_gemv4_kernel(out:UOp, W8:UOp, x:UOp, sel:UOp, out_features:int, in_f
   expert = sel[0, 0, e]
   r = UOp.range(rows, 1, AxisType.LOCAL)
   g = UOp.range(16, 2, AxisType.LOCAL)          # 16 threads x 32 elems/thread = 512
-  b = UOp.range(8, 3, AxisType.REDUCE)          # (block, half, quartet)
+  b = UOp.range(8, 3, AxisType.WEAK)          # (block, half, quartet)
   row = rg * rows + r
   cb, h, q = b // 4, (b // 2) % 2, b % 2
   i = g + 16 * q
@@ -399,7 +399,7 @@ def q80_gemv4_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int, 
   o = UOp.range(out_features // rows, 0, AxisType.GLOBAL)
   r = UOp.range(rows, 1, AxisType.LOCAL)
   g = UOp.range(groups, 2, AxisType.LOCAL)
-  b2 = UOp.range(16, 3, AxisType.REDUCE)
+  b2 = UOp.range(16, 3, AxisType.WEAK)
   row = o * rows + r
   wbase = row * row16 + g * (_Q80_BLOCK_BYTES // 2)
   def U16(i): return (W8[i * 2].cast(dtypes.uint16) | W8[i * 2 + 1].cast(dtypes.uint16).lshift(8))
@@ -474,7 +474,7 @@ def q6k_gemv4_kernel(out:UOp, W8:UOp, x:UOp, out_features:int, in_features:int, 
   o = UOp.range(out_features // rows, 0, AxisType.GLOBAL)
   r = UOp.range(rows, 1, AxisType.LOCAL)
   g = UOp.range(in_features // 32, 2, AxisType.LOCAL)
-  k = UOp.range(8, 3, AxisType.REDUCE)
+  k = UOp.range(8, 3, AxisType.WEAK)
   row = o * rows + r
   cb, w8 = g // 8, g % 8
   h, s = w8 // 4, w8 % 4
