@@ -204,6 +204,18 @@ class VulkanProgram(Program['VulkanDevice']):
     self._is_buf = tuple(s[1] is not AddrSpace.ALU for s in self.signature)
     self._var_dts = tuple(s[2] for s in self.signature if s[1] is AddrSpace.ALU)
     self._var_names = tuple(s[0] for s in self.signature if s[1] is AddrSpace.ALU)
+    # SPIRVCompiler appends 16B param read/write masks + a 'RWML' magic (see _rmw_masks in nir.py).
+    # On NV, first launches of a cold pipeline get a throwaway warmup dispatch; if the same buffer
+    # is bound to a read AND a write position, that dispatch double-applies its in-place stores,
+    # so those launches skip the warmup (a single run risks no store-loss on these small kernels:
+    # verified stable on test_after; the lossy case is kernels whose output buffer is fresh).
+    self._rpos:tuple[int, ...] = ()
+    self._wpos:tuple[int, ...] = ()
+    if self.lib[-4:] == b'RWML':
+      rb, wb = struct.unpack('<QQ', self.lib[-20:-4])
+      self._rpos = tuple(i for i in range(64) if rb>>i & 1)
+      self._wpos = tuple(i for i in range(64) if wb>>i & 1)
+      self.lib = self.lib[:-20]
     self._cache:dict[tuple, tuple] = {}
     self._n = 0
     # VK_REPLAY: per-signature template CBTs (rkey = (nbufs, nvals, bufs..., grid)), the
@@ -262,7 +274,13 @@ class VulkanProgram(Program['VulkanDevice']):
       rt._pt("ubo", u0)
     if self.dev._arm:
       self.dev._arm_cur.append(("K", self._arm_id, self.name, len(bufs), cfg_key[2:], global_size, self._var_names, vals))
-    if is_new and _warmup_vendors(rt):
+    warm = is_new and _warmup_vendors(rt)
+    if warm and self._rpos and self._wpos:
+      # same buffer bound to both a read and a write position => in-place: a throwaway dispatch would
+      # run it twice. compare by (vbuf, offset) identity, both position lists are tiny.
+      rids = {(b.vbuf.handle.value, b.offset) for i, b in enumerate(bufs) if i in self._rpos}
+      warm = not any((b.vbuf.handle.value, b.offset) in rids for i, b in enumerate(bufs) if i in self._wpos)
+    if warm:
       # throwaway full-grid dispatch: primes the cold pipeline so the real launch below is
       # its second (the first loses stores on NV 550); must be the full grid -- a smaller
       # warmup grid does not prime it. Drained before the real dispatch.
