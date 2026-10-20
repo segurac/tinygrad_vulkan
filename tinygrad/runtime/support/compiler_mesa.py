@@ -1,4 +1,4 @@
-import base64, ctypes, os, pathlib, tempfile, hashlib
+import base64, ctypes, os, pathlib, tempfile, hashlib, struct
 from tinygrad.device import Compiler
 from tinygrad.helpers import cpu_objdump, system, data64
 from tinygrad.runtime.autogen import mesa, llvm, libc
@@ -12,6 +12,8 @@ def rzalloc(typ, ctx=None, **kwargs):
   return s
 
 def deserialize(enc_src, opts):
+  # the renderer appends '|'+64 hex chars of param read/write masks to the base64 blob; strip it.
+  if isinstance(enc_src, str): enc_src = enc_src.rsplit('|', 1)[0]
   blobreader = mesa.struct_blob_reader()
   mesa.blob_reader_init(blobreader, src:=base64.b64decode(enc_src), len(src))
   return mesa.nir_deserialize(None, ctypes.cast(opts, ctypes.POINTER(mesa.nir_shader_compiler_options)), blobreader)
@@ -164,14 +166,20 @@ class SPIRVCompiler(Compiler):
   def __reduce__(self): return SPIRVCompiler, (self.arch,)
 
   def compile(self, src) -> bytes:
-    # src is the base64 encoded serialized NIR blob from the renderer (or the raw blob bytes)
+    # src is the base64 encoded serialized NIR blob from the renderer (or the raw blob bytes), with the
+    # renderer's '|'+hex param read/write mask trailer appended when it's the str form. Append the masks
+    # + a magic to the SPIR-V so the runtime can gate the NV warmup on launch-time buffer aliasing.
+    rb = wb = 0
+    if isinstance(src, str) and (i:=src.rfind('|')) != -1:
+      src, h = src[:i], src[i+1:]
+      rb, wb = int(h[:16], 16), int(h[16:32], 16)
     assert self.lib is not None, "TINYGRAD_SPV_DIR is set but this kernel has no pre-compiled shader (re-dump with VKDUMP=1)"
     blob = base64.b64decode(src) if isinstance(src, str) else bytes(src)
     out_words, out_num = ctypes.POINTER(ctypes.c_uint32)(), ctypes.c_size_t(0)
     assert self.lib.tinyzink_nirblob_to_spirv(blob, len(blob), ctypes.byref(out_words), ctypes.byref(out_num)) == 0, "nir_to_spirv failed"
     ret = bytes((ctypes.c_uint32 * out_num.value).from_address(ctypes.addressof(out_words.contents)))
     self.lib.tinyzink_free_words(out_words)
-    return ret
+    return ret + struct.pack('<QQ', rb, wb) + b'RWML'
 
   def disassemble(self, lib: bytes):
     words = (ctypes.c_uint32 * (len(lib) // 4)).from_buffer_copy(lib)

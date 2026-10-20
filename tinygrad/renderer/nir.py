@@ -11,6 +11,23 @@ import base64, ctypes, struct, functools, inspect, itertools
 def g(s:str): return getattr(mesa, s)
 def nsrc(d:mesa.nir_def) -> mesa.nir_src: return mesa.nir_src(ssa=ctypes.pointer(d))
 
+def _rmw_masks(uops:list[UOp]) -> tuple[int, int]:
+  # (read_bits, write_bits): bit i set if the i-th GLOBAL param (slot order == the runtime's bufs
+  # order) is loaded / stored. A launch binding the same buffer to a read and a write position is
+  # an in-place read-modify-write: running it twice is not idempotent, so it must not get the NV
+  # cold-pipeline warmup dispatch.
+  gparams = sorted((u for u in uops if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU), key=lambda u:u.arg.slot)
+  pos = {u.arg.slot:i for i, u in enumerate(gparams)}
+  rb = wb = 0
+  for u in uops:
+    if u.op not in {Ops.LOAD, Ops.STORE} or u.src[0].op not in {Ops.INDEX, Ops.SHRINK}: continue
+    buf = u.src[0].src[0]
+    while buf.op is Ops.AFTER: buf = buf.src[0]
+    if buf.op is Ops.PARAM and (i:=pos.get(buf.arg.slot)) is not None:
+      bit = 1 << min(i, 63)
+      rb, wb = (rb|bit, wb) if u.op is Ops.LOAD else (rb, wb|bit)
+  return rb, wb
+
 def glsl_type(t:DType): return {
   **{getattr(dtypes,k):g(f"glsl_type_builtin_{v}") for k,v in [('double','double'),('float','float'),('float16','float16_t'),('bool','uint8_t')]},
   **{d:g(f"glsl_type_builtin_{'u' * (d in dtypes.uints)}int{str(d.bitsize)+'_t' if d.itemsize != 4 else ''}") for d in dtypes.ints}}[t]
@@ -271,7 +288,10 @@ class NIRRenderer(Renderer):
     ctypes.CDLL(None).free(blob.data)
     del self.b, self.r
 
-    return ret
+    # '|' + 32 hex chars of (read_bits, write_bits) param masks (see _rmw_masks): stripped by the
+    # mesa compilers, drives the NV warmup gate in VulkanProgram. '|' never appears in base64.
+    rb, wb = _rmw_masks(uops)
+    return f"{ret}|{rb:016x}{wb:016x}"
 
   def supported_dtypes(self): return {d for d in Renderer.supported_dtypes(self) if d not in dtypes.fp8s+(dtypes.bfloat16,)}
 
